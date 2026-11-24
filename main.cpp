@@ -57,6 +57,15 @@ const float DRONE_MIN_X = -200.0f;
 const float DRONE_MAX_X = 680.0f; // Giới hạn phía Đông ở đảo ngoài biển.
 const float DRONE_LIMIT_Z = 200.0f;
 
+// 2 Tòa Siêu Cao Ốc Landmark mang Bãi Đáp Trực Thăng (Helipads)
+const float HELIPAD_1_X = 83.7f;
+const float HELIPAD_1_Z = 83.7f;
+const float HELIPAD_1_Y = 74.0f;
+
+const float HELIPAD_2_X = -126.3f;
+const float HELIPAD_2_Z = -21.3f;
+const float HELIPAD_2_Y = 74.0f;
+
 struct Vec3 {
     float x, y, z;
     Vec3(float X = 0.0f, float Y = 0.0f, float Z = 0.0f) : x(X), y(Y), z(Z) {}
@@ -116,6 +125,16 @@ float invulnerableTimer = 0.0f;
 bool paused = false;
 bool wireframeMode = false;
 
+// Cải tiến vật lý, rung lắc và hỗ trợ hiển thị HUD
+float cameraShakeTimer = 0.0f;
+float collisionFlashTimer = 0.0f;
+float proximityDist = 999.0f;
+Vec3 smoothCameraEye(0.0f, 20.0f, 20.0f);
+Vec3 smoothCameraLook(0.0f, 18.0f, 0.0f);
+bool smoothCamInitialized = false;
+bool isDroneLanded = false;
+bool searchlightOn = true;
+
 // Hệ quan sát Camera
 int cameraMode = 1;               // 0: FPV, 1: Bám theo sau đuôi, 2: Quỹ đạo tự do
 bool parallelProjection = false;
@@ -142,6 +161,9 @@ struct CityCar {
     float dir;
     Color4 color;
     bool runsAlongX;
+    float currentSpeed;
+    CityCar(float X = 0.0f, float Z = 0.0f, float S = 18.0f, float D = 1.0f, Color4 C = Color4(), bool RAX = false, float CS = -1.0f)
+        : x(X), z(Z), speed(S), dir(D), color(C), runsAlongX(RAX), currentSpeed(CS < 0.0f ? S : CS) {}
 };
 std::vector<CityCar> cityCars;
 
@@ -187,12 +209,13 @@ enum AmenityType {
 };
 
 int districtAmenity(int districtX, int districtZ) {
-    // Vị trí tiện ích được khóa theo quận, mỗi công trình chỉ có một vị trí trong bản đồ.
-    if (districtX == 0 && districtZ == 0) return AMENITY_MALL;
+    // Bố cục Đô Thị Phân Khu (Zoning Masterplan theo Hình mẫu kiến trúc)
+    if (districtX == 0 && districtZ == 0) return AMENITY_CITY; // Khu Đô Thị Trung Tâm theo hình mẫu
     if (districtX == -1 && districtZ == 0) return AMENITY_PARK;
     if (districtX == 0 && districtZ == -1) return AMENITY_STADIUM;
     if (districtX == 1 && districtZ == 0) return AMENITY_SCHOOL;
     if (districtX == -1 && districtZ == -1) return AMENITY_HOSPITAL;
+    if (districtX == 0 && districtZ == 1) return AMENITY_MALL; // TTTM dời lên quận (0, 1)
     if ((districtX == 1 && districtZ == 1) ||
         (districtX == -2 && districtZ == 1) ||
         (districtX == 1 && districtZ == -1)) return AMENITY_RESIDENTIAL;
@@ -314,6 +337,53 @@ void drawCone(float radius, float height, int slices = 24) {
     glEnd();
 }
 
+void drawDuctRing(float innerR, float outerR, float height, int slices = 24) {
+    glBegin(GL_QUAD_STRIP);
+    for (int i = 0; i <= slices; ++i) {
+        float a = 2.0f * PI * i / slices;
+        float c = std::cos(a), s = std::sin(a);
+        glNormal3f(-c, 0.0f, -s);
+        glVertex3f(innerR * c, -height * 0.5f, innerR * s);
+        glVertex3f(innerR * c,  height * 0.5f, innerR * s);
+    }
+    glEnd();
+    glBegin(GL_QUAD_STRIP);
+    for (int i = 0; i <= slices; ++i) {
+        float a = 2.0f * PI * i / slices;
+        float c = std::cos(a), s = std::sin(a);
+        glNormal3f(c, 0.0f, s);
+        glVertex3f(outerR * c,  height * 0.5f, outerR * s);
+        glVertex3f(outerR * c, -height * 0.5f, outerR * s);
+    }
+    glEnd();
+    glBegin(GL_QUAD_STRIP);
+    for (int i = 0; i <= slices; ++i) {
+        float a = 2.0f * PI * i / slices;
+        float c = std::cos(a), s = std::sin(a);
+        glNormal3f(0.0f, 1.0f, 0.0f);
+        glVertex3f(innerR * c, height * 0.5f, innerR * s);
+        glVertex3f(outerR * c, height * 0.5f, outerR * s);
+    }
+    glEnd();
+}
+
+void drawPropellerDisk(float radius, float alpha) {
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glBegin(GL_TRIANGLE_FAN);
+    glColor4f(0.25f, 0.85f, 1.0f, alpha * 0.65f);
+    glVertex3f(0.0f, 0.0f, 0.0f);
+    for (int i = 0; i <= 24; ++i) {
+        float a = 2.0f * PI * i / 24.0f;
+        glColor4f(0.15f, 0.70f, 0.95f, alpha * 0.22f);
+        glVertex3f(radius * std::cos(a), 0.0f, radius * std::sin(a));
+    }
+    glEnd();
+    glPopAttrib();
+}
+
 // Đường cong Bezier bậc 3 vẽ dây cáp điện
 Vec3 bezierPoint(const Vec3 cp[4], float t) {
     float u = 1.0f - t;
@@ -398,138 +468,369 @@ void drawBezierDome(float cx, float baseY, float cz) {
 }
 
 // =========================================================================================
-// 6. MÔ HÌNH DRONE NGƯỜI CHƠI (HIỆN ĐẠI, GỌN GÀNG)
+// 6. MÔ HÌNH DRONE NGƯỜI CHƠI (HIỆN ĐẠI, THỂ THAO, CÓ GIMBAL CAMERA VÀ VÒNG BẢO VỆ CÁNH)
 // =========================================================================================
 void drawDrone() {
+    float hoverBob = (1.0f - std::min(1.0f, length(droneVelocity) * 0.12f)) * std::sin(animTime * 3.2f) * 0.05f;
+
     glPushMatrix();
-    glTranslatef(drone.x, drone.y, drone.z);
+    glTranslatef(drone.x, drone.y + hoverBob, drone.z);
     glRotatef(droneRoll, 0.0f, 0.0f, 1.0f);
     glRotatef(dronePitch, 1.0f, 0.0f, 0.0f);
     glRotatef(-theta * 180.0f / PI, 0.0f, 1.0f, 0.0f);
 
-    // Thân Drone xám than carbon & trắng thanh lịch
-    setMaterial(0.22f, 0.25f, 0.30f, 75.0f, 0.8f);
-    Vec3 base[4] = {
-        Vec3(-0.62f, -0.28f,  0.30f),
-        Vec3( 0.62f, -0.28f,  0.30f),
-        Vec3( 0.62f,  0.28f,  0.30f),
-        Vec3(-0.62f,  0.28f,  0.30f)
-    };
-    Vec3 tip(0.0f, 0.0f, -0.80f);
-
-    glBegin(GL_TRIANGLES);
-        glNormal3f(0.0f, 0.0f, 1.0f);
-        glVertex3f(base[0].x, base[0].y, base[0].z);
-        glVertex3f(base[1].x, base[1].y, base[1].z);
-        glVertex3f(base[2].x, base[2].y, base[2].z);
-
-        glNormal3f(0.0f, 0.0f, 1.0f);
-        glVertex3f(base[0].x, base[0].y, base[0].z);
-        glVertex3f(base[2].x, base[2].y, base[2].z);
-        glVertex3f(base[3].x, base[3].y, base[3].z);
-
-        outwardTriangle(base[0], base[1], tip, Vec3(0, -0.2f, 1));
-        outwardTriangle(base[1], base[2], tip, Vec3(1, 0, 0));
-        outwardTriangle(base[2], base[3], tip, Vec3(0, 0.2f, 1));
-        outwardTriangle(base[3], base[0], tip, Vec3(-1, 0, 0));
-    glEnd();
-
-    // Vòm kính buồng lái màu xanh ngọc lam trong sáng
-    setMaterial(0.20f, 0.65f, 0.85f, 95.0f, 0.95f);
+    // 1. THÂN CHÍNH KHÍ ĐỘNG HỌC (Aerodynamic Fuselage)
+    // Khoang lưng trên (Top Shell - Sợi carbon xám than mờ sang trọng)
+    setMaterial(0.18f, 0.21f, 0.26f, 85.0f, 0.85f);
     glPushMatrix();
-    glTranslatef(0.0f, 0.32f, -0.08f);
-    glScalef(0.24f, 0.18f, 0.26f);
+    glTranslatef(0.0f, 0.02f, -0.02f);
+    glScalef(0.36f, 0.12f, 0.52f);
+    glutSolidSphere(1.0, 18, 14);
+    glPopMatrix();
+
+    // Mũi khí động học phía trước (Nose Cone)
+    setMaterial(0.24f, 0.28f, 0.35f, 90.0f, 0.8f);
+    glPushMatrix();
+    glTranslatef(0.0f, 0.035f, -0.28f);
+    glScalef(0.22f, 0.075f, 0.24f);
+    glutSolidSphere(1.0, 16, 10);
+    glPopMatrix();
+
+    // Bụng máy bay bảo vệ pin (Underbody Battery Compartment)
+    setMaterial(0.11f, 0.13f, 0.17f, 60.0f, 0.5f);
+    glPushMatrix();
+    glTranslatef(0.0f, -0.12f, 0.02f);
+    glScalef(0.28f, 0.08f, 0.44f);
+    glutSolidSphere(1.0, 16, 10);
+    glPopMatrix();
+
+    // Dải decal sọc thể thao màu cam neon (Neon Racing Decal)
+    setMaterial(1.0f, 0.44f, 0.08f, 70.0f, 0.4f);
+    glPushMatrix();
+    glTranslatef(0.0f, 0.12f, 0.01f);
+    glScalef(0.055f, 0.025f, 0.38f);
+    glutSolidCube(1.0);
+    glPopMatrix();
+
+    // Cảm biến tránh va chạm kép phía trước (Obstacle Avoidance Dual Vision Sensors)
+    setMaterial(0.04f, 0.06f, 0.09f, 95.0f, 0.95f);
+    for (int s = -1; s <= 1; s += 2) {
+        glPushMatrix();
+        glTranslatef(s * 0.10f, 0.04f, -0.42f);
+        glScalef(0.032f, 0.032f, 0.02f);
+        glutSolidSphere(1.0, 12, 8);
+        glPopMatrix();
+    }
+
+    // 2. CỤM GIMBAL CAMERA 3 TRỤC DƯỚI MŨI (3-Axis Gimbal & 4K Camera)
+    glPushMatrix();
+    glTranslatef(0.0f, -0.12f, -0.32f);
+    // Khung treo Gimbal (Gimbal Yaw Bracket)
+    setMaterial(0.35f, 0.38f, 0.42f, 80.0f, 0.8f);
+    glPushMatrix();
+    glScalef(0.09f, 0.03f, 0.09f);
+    glutSolidCube(1.0);
+    glPopMatrix();
+
+    // Trục xoay gật camera theo góc ngắm (Camera Pitch)
+    glRotatef(clampf(phi * RAD2DEG * 0.45f - 8.0f, -40.0f, 25.0f), 1.0f, 0.0f, 0.0f);
+
+    // Thân Camera Pod
+    glTranslatef(0.0f, -0.075f, -0.03f);
+    setMaterial(0.12f, 0.14f, 0.18f, 90.0f, 0.85f);
+    glPushMatrix();
+    glScalef(0.11f, 0.095f, 0.14f);
     glutSolidSphere(1.0, 16, 12);
     glPopMatrix();
 
-    // Bụng máy bay, nẹp thân và mũi tên giúp drone có dáng quadcopter rõ ràng hơn.
-    setMaterial(0.10f, 0.14f, 0.19f, 60.0f, 0.55f);
-    glPushMatrix(); glTranslatef(0.0f, -0.24f, 0.02f); glScalef(0.48f, 0.10f, 0.55f); glutSolidSphere(1.0, 16, 10); glPopMatrix();
-    setMaterial(0.98f, 0.43f, 0.16f, 45.0f, 0.35f);
-    glPushMatrix(); glTranslatef(0.0f, 0.04f, -0.54f); glScalef(0.055f, 0.045f, 0.27f); glutSolidCube(1.0); glPopMatrix();
+    // Vành kim loại vàng quanh ống kính (Gold Accent Ring)
+    setMaterial(0.95f, 0.78f, 0.22f, 95.0f, 0.95f);
+    glPushMatrix();
+    glTranslatef(0.0f, 0.0f, -0.10f);
+    drawCylinder(0.065f, 0.025f, 16);
+    glPopMatrix();
 
-    // Bốn càng carbon bắt chéo, chạm đúng tâm từng cụm động cơ.
+    // Thấu kính Camera kính xanh ngọc bích bóng bẩy (Reflective Blue/Cyan Lens)
+    setMaterial(0.12f, 0.65f, 0.88f, 100.0f, 1.0f);
+    glPushMatrix();
+    glTranslatef(0.0f, 0.0f, -0.115f);
+    glScalef(0.055f, 0.055f, 0.018f);
+    glutSolidSphere(1.0, 14, 8);
+    glPopMatrix();
+    glPopMatrix();
+
+    // 3. BỐN CÀNG CARBON, ĐỘNG CƠ, VÒNG BẢO VỆ CÁNH (Propeller Ducts) VÀ CÁNH QUẠT 3 LÁ
     for (int sx = -1; sx <= 1; sx += 2) {
         for (int sz = -1; sz <= 1; sz += 2) {
-            float rx = 1.30f * sx, rz = 0.94f * sz;
+            float rx = 0.86f * sx, rz = 0.66f * sz;
 
-            setMaterial(0.14f, 0.19f, 0.24f, 60.0f, 0.5f);
+            // Càng đỡ carbon gia cường (Carbon Fiber Arm)
+            setMaterial(0.14f, 0.17f, 0.22f, 75.0f, 0.7f);
             glPushMatrix();
-            glTranslatef(rx * 0.50f, -0.04f, rz * 0.50f);
+            glTranslatef(rx * 0.50f, -0.02f, rz * 0.50f);
             glRotatef(std::atan2(-rz, rx) * RAD2DEG, 0.0f, 1.0f, 0.0f);
-            glScalef(std::sqrt(rx * rx + rz * rz) * 0.56f, 0.075f, 0.095f);
+            glScalef(std::sqrt(rx * rx + rz * rz) * 0.58f, 0.048f, 0.07f);
             glutSolidCube(1.0);
             glPopMatrix();
 
-            // Đệm cao su và động cơ hình trụ, có vòng kim loại trên đỉnh.
+            // Cụm động cơ (Brushless Motor Pod)
             glPushMatrix();
-            glTranslatef(rx, -0.01f, rz);
-            setMaterial(0.30f, 0.34f, 0.40f, 60.0f);
-            drawCylinder(0.20f, 0.24f, 20);
+            glTranslatef(rx, -0.02f, rz);
 
-            glTranslatef(0.0f, 0.25f, 0.0f);
-            setMaterial(0.80f, 0.86f, 0.90f, 75.0f, 0.7f);
-            drawCylinder(0.22f, 0.055f, 20);
+            // Thân động cơ xám titan
+            setMaterial(0.30f, 0.33f, 0.38f, 85.0f, 0.8f);
+            drawCylinder(0.13f, 0.16f, 18);
 
-            // Hai cánh quạt elip quay liên tục quanh trục đứng.
-            glTranslatef(0.0f, 0.07f, 0.0f);
+            // Nắp chuông động cơ màu đồng ánh kim
+            glTranslatef(0.0f, 0.16f, 0.0f);
+            setMaterial(0.85f, 0.68f, 0.28f, 90.0f, 0.85f);
+            drawCylinder(0.135f, 0.035f, 18);
+
+            // VÒNG BẢO VỆ CÁNH (Propeller Duct / Bumper Ring)
+            glPushMatrix();
+            glTranslatef(0.0f, 0.04f, 0.0f);
+            setMaterial(0.20f, 0.24f, 0.30f, 60.0f, 0.5f);
+            drawDuctRing(0.39f, 0.43f, 0.065f, 24);
+
+            // 3 Nan hoa nối từ động cơ ra vòng bảo vệ
+            for (int sp = 0; sp < 3; ++sp) {
+                glPushMatrix();
+                glRotatef(sp * 120.0f, 0.0f, 1.0f, 0.0f);
+                glTranslatef(0.22f, 0.0f, 0.0f);
+                glScalef(0.18f, 0.015f, 0.024f);
+                glutSolidCube(1.0);
+                glPopMatrix();
+            }
+            glPopMatrix();
+
+            // CÁNH QUẠT 3 LÁ (Tri-blade Rotor) + ĐĨA MOTION BLUR
+            glTranslatef(0.0f, 0.055f, 0.0f);
+            drawPropellerDisk(0.39f, 0.45f); // Đĩa quay mờ xé gió
+
             glRotatef(rotorAngle * (sx * sz), 0.0f, 1.0f, 0.0f);
-            for (int blade = -1; blade <= 1; blade += 2) {
-                setMaterial(blade < 0 ? 0.18f : 0.28f, 0.68f, 0.88f, 70.0f, 0.65f);
-                glPushMatrix(); glTranslatef(blade * 0.36f, 0.0f, 0.0f); glScalef(0.39f, 0.025f, 0.075f); glutSolidSphere(1.0, 14, 8); glPopMatrix();
+            for (int b = 0; b < 3; ++b) {
+                glPushMatrix();
+                glRotatef(b * 120.0f, 0.0f, 1.0f, 0.0f);
+                glTranslatef(0.16f, 0.0f, 0.0f);
+                glScalef(0.18f, 0.012f, 0.038f);
+                setMaterial(0.12f, 0.68f, 0.92f, 75.0f, 0.7f); // Cánh quạt xanh thể thao
+                glutSolidSphere(1.0, 10, 6);
+                glPopMatrix();
             }
 
-            // Đèn định hướng đỏ bên trái, xanh lá bên phải.
-            setMaterial(sx < 0 ? 0.98f : 0.12f, sx < 0 ? 0.20f : 0.92f, sx < 0 ? 0.12f : 0.36f, 25.0f, 0.1f);
-            glPushMatrix(); glTranslatef(0.0f, 0.04f, 0.0f); glScalef(0.12f, 0.075f, 0.12f); glutSolidSphere(1.0, 10, 8); glPopMatrix();
+            // ĐÈN LED ĐỊNH VỊ HÀNG KHÔNG (Aviation LEDs)
+            // Phía trước: Đỏ bên trái (Port), Xanh lá bên phải (Starboard)
+            // Phía sau: Xanh dương; chớp trắng định kỳ (Strobe flash)
+            bool isStrobe = std::fmod(animTime, 0.55f) < 0.20f;
+            if (sz < 0) {
+                if (sx < 0) setMaterial(0.98f, 0.15f, 0.15f, 40.0f, 0.2f); // LED Đỏ
+                else        setMaterial(0.15f, 0.95f, 0.25f, 40.0f, 0.2f); // LED Xanh lá
+            } else {
+                if (isStrobe) setMaterial(0.98f, 0.98f, 1.0f, 100.0f, 0.9f); // Chớp trắng
+                else          setMaterial(0.20f, 0.50f, 0.98f, 40.0f, 0.2f); // Xanh dương
+            }
+            glPushMatrix();
+            glTranslatef(0.0f, -0.20f, 0.0f);
+            glScalef(0.065f, 0.045f, 0.065f);
+            glutSolidSphere(1.0, 10, 8);
+            glPopMatrix();
 
             glPopMatrix();
         }
     }
 
-    // Hai càng hạ cánh cong nhẹ nằm dưới thân.
-    setMaterial(0.78f, 0.84f, 0.88f, 55.0f, 0.4f);
+    // 4. HAI CÀNG TIẾP ĐẤT (Landing Skids)
+    setMaterial(0.68f, 0.72f, 0.76f, 60.0f, 0.5f);
     for (int side = -1; side <= 1; side += 2) {
-        glPushMatrix(); glTranslatef(side * 0.42f, -0.38f, 0.16f); glScalef(0.055f, 0.26f, 0.055f); glutSolidCube(1.0); glPopMatrix();
-        glPushMatrix(); glTranslatef(side * 0.52f, -0.50f, 0.16f); glScalef(0.35f, 0.055f, 0.10f); glutSolidCube(1.0); glPopMatrix();
+        // Chân chống đứng
+        glPushMatrix();
+        glTranslatef(side * 0.26f, -0.22f, 0.06f);
+        glScalef(0.03f, 0.16f, 0.03f);
+        glutSolidCube(1.0);
+        glPopMatrix();
+
+        // Thanh trượt ngang tiếp xúc mặt đất
+        glPushMatrix();
+        glTranslatef(side * 0.26f, -0.30f, 0.02f);
+        glScalef(0.04f, 0.028f, 0.36f);
+        glutSolidCube(1.0);
+        glPopMatrix();
     }
 
-    // Đèn pha trước chiếu sáng
-    setMaterial(1.0f, 0.95f, 0.65f, 80.0f);
+    // 5. ĐÈN PHA RỌI TRƯỚC (Front LED Searchlight)
+    setMaterial(1.0f, 0.98f, 0.75f, 90.0f, 0.9f);
     glPushMatrix();
-    glTranslatef(0.0f, -0.05f, -0.72f);
-    glScalef(0.12f, 0.10f, 0.14f);
+    glTranslatef(0.0f, -0.04f, -0.48f);
+    glScalef(0.08f, 0.07f, 0.10f);
     glutSolidSphere(1.0, 12, 8);
     glPopMatrix();
 
+
+
     glPopMatrix();
+}
+
+/**
+ * Vẽ Hiệu ứng Luồng gió thổi bụi & Sóng khí động học dưới gầm Drone (Downwash Wind & Ground Dust)
+ */
+void drawDroneDownwash() {
+    float groundY = -0.32f;
+    float d1 = std::hypot(drone.x - HELIPAD_1_X, drone.z - HELIPAD_1_Z);
+    float d2 = std::hypot(drone.x - HELIPAD_2_X, drone.z - HELIPAD_2_Z);
+    if ((d1 < 5.2f || d2 < 5.2f) && drone.y > 70.0f) groundY = HELIPAD_1_Y;
+
+    float distToFloor = drone.y - groundY;
+    if (distToFloor > 0.1f && distToFloor < 5.5f) {
+        float factor = 1.0f - distToFloor / 5.5f;
+
+        glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_LIGHTING);
+        glDepthMask(GL_FALSE);
+
+        // 1. Vòng sóng khí động học giãn nở lan tỏa trên mặt sàn
+        for (int ring = 0; ring < 2; ++ring) {
+            float phase = std::fmod(animTime * 3.5f + ring * 0.5f, 1.0f);
+            float ringR = 0.8f + phase * 3.4f;
+            float ringAlpha = (1.0f - phase) * 0.40f * factor;
+
+            glPushMatrix();
+            glTranslatef(drone.x, groundY + 0.025f, drone.z);
+            glLineWidth(2.2f);
+            glColor4f(0.85f, 0.95f, 1.0f, ringAlpha);
+            glBegin(GL_LINE_LOOP);
+            for (int i = 0; i < 24; ++i) {
+                float a = 2.0f * PI * i / 24.0f;
+                glVertex3f(std::cos(a) * ringR, 0.0f, std::sin(a) * ringR);
+            }
+            glEnd();
+            glPopMatrix();
+        }
+
+        // 2. Các hạt bụi/gió li ti xoáy tản tròn dưới 4 luồng cánh quạt
+        for (int p = 0; p < 12; ++p) {
+            float seed = (float)p * (2.0f * PI / 12.0f);
+            float pDist = 1.2f + 2.5f * std::fmod(animTime * 4.0f + p * 0.18f, 1.0f);
+            float pAngle = seed + animTime * 8.0f;
+            float px = drone.x + std::cos(pAngle) * pDist;
+            float pz = drone.z + std::sin(pAngle) * pDist;
+            float pAlpha = (1.0f - (pDist - 1.2f) / 2.5f) * 0.45f * factor;
+
+            glPushMatrix();
+            glTranslatef(px, groundY + 0.03f, pz);
+            glColor4f(0.92f, 0.90f, 0.80f, pAlpha);
+            glScalef(0.12f, 0.04f, 0.12f);
+            glutSolidSphere(1.0, 6, 4);
+            glPopMatrix();
+        }
+
+        glLineWidth(1.0f);
+        glPopAttrib();
+    }
+}
+
+void drawDroneShadow() {
+    float groundY = -0.32f;
+    if (drone.y > groundY + 0.1f && drone.y < 75.0f) {
+        float h = drone.y - groundY;
+        float alpha = clampf((1.0f - h / 75.0f) * 0.42f, 0.04f, 0.45f);
+        float radius = 0.85f + h * 0.05f;
+
+        glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_LIGHTING);
+        glDepthMask(GL_FALSE);
+
+        // 1. Bóng đổ mềm mặt đất dưới Drone
+        glPushMatrix();
+        glTranslatef(drone.x, groundY + 0.015f, drone.z);
+        glBegin(GL_TRIANGLE_FAN);
+            glColor4f(0.03f, 0.05f, 0.08f, alpha);
+            glVertex3f(0.0f, 0.0f, 0.0f);
+            for (int i = 0; i <= 24; ++i) {
+                float a = 2.0f * PI * i / 24.0f;
+                glColor4f(0.03f, 0.05f, 0.08f, 0.0f);
+                glVertex3f(std::cos(a) * radius * 1.35f, 0.0f, std::sin(a) * radius * 1.15f);
+            }
+        glEnd();
+        glPopMatrix();
+
+
+
+        glPopAttrib();
+    }
 }
 
 // =========================================================================================
 // 7. KIẾN TRÚC CAO ỐC PHONG CÁCH HÌNH 2 (ĐỒ HỌA SÁNG RÕ, THANH LỊCH)
 // =========================================================================================
 Building getBuilding(int gridX, int gridZ) {
-    // Lùi các công trình sát mép lô để vỉa hè, cây xanh và khoảng sân luôn thông thoáng.
     int district = districtAmenity(floorDiv6(gridX), floorDiv6(gridZ));
     bool residential = district == AMENITY_RESIDENTIAL;
-    float width = (residential ? 12.0f : 13.2f) + gridHash01(gridX, gridZ, 0x713u) * (residential ? 2.0f : 2.0f);
-    float depth = (residential ? 11.5f : 13.2f) + gridHash01(gridX, gridZ, 0x714u) * (residential ? 2.2f : 2.0f);
     int localX = ((gridX % 6) + 6) % 6;
     int localZ = ((gridZ % 6) + 6) % 6;
+
+    // Lùi vào trong lô để chừa vỉa hè rộng và sân quảng trường đi bộ
     float insetX = localX == 1 ? 3.8f : (localX == 5 ? -3.8f : 0.0f);
-    float insetZ = localZ == 1 ? 3.8f : (localZ == 5 ? -3.8f : 0.0f);
-    float x = gridX * CITY_GRID_SPACING + insetX + (gridHash01(gridX, gridZ, 0x41u) - 0.5f) * 0.8f;
-    float z = gridZ * CITY_GRID_SPACING + insetZ + (gridHash01(gridX, gridZ, 0x91u) - 0.5f) * 0.8f;
-    float heightPick = gridHash01(gridX, gridZ, 0x551u);
-    float h = residential ? 8.5f + gridHash01(gridX, gridZ, 0x552u) * 8.0f
-            : heightPick < 0.60f ? 20.0f + gridHash01(gridX, gridZ, 0x552u) * 24.0f
-            : heightPick < 0.86f ? 44.0f + gridHash01(gridX, gridZ, 0x553u) * 26.0f
-                                 : 72.0f + gridHash01(gridX, gridZ, 0x554u) * 30.0f;
-    float colorPick = gridHash01(gridX, gridZ, 0x331u);
-    int style = residential ? (colorPick < 0.42f ? 1 : (colorPick < 0.76f ? 0 : 5))
-              : colorPick < 0.42f ? 0 : colorPick < 0.64f ? 1 :
-                colorPick < 0.82f ? 2 : colorPick < 0.87f ? 3 :
-                colorPick < 0.94f ? 4 : 5;
+    float insetZ = localZ == 1 ? 4.5f : (localZ == 5 ? -3.8f : 0.0f);
+
+    float x = gridX * CITY_GRID_SPACING + insetX;
+    float z = gridZ * CITY_GRID_SPACING + insetZ;
+
+    float width = 14.0f, depth = 13.5f, h = 30.0f;
+    int style = 0;
+
+    if (residential) {
+        width = 12.0f + gridHash01(gridX, gridZ, 0x713u) * 2.0f;
+        depth = 11.5f + gridHash01(gridX, gridZ, 0x714u) * 2.0f;
+        h = 9.0f + gridHash01(gridX, gridZ, 0x552u) * 6.5f;
+        float colorPick = gridHash01(gridX, gridZ, 0x331u);
+        style = colorPick < 0.42f ? 1 : (colorPick < 0.76f ? 0 : 5);
+    } else {
+        // BỐ CỤC ĐÔ THỊ GIẬT CẤP HÌNH BẬC THANG / RẠP HÁT (STEPPED AMPHITHEATER SKYLINE THEO HÌNH MẪU)
+        // localZ == 1: HÀNG TIỀN CẢNH (THẤP NHẤT - SHOPHOUSE & BOUTIQUE RETAIL)
+        if (localZ == 1) {
+            if (localX == 1) {
+                // Tòa nhà boutique vàng cam ấm (amber), 4 tầng, có khối penthouse vòm và mái che
+                width = 13.2f; depth = 12.0f; h = 18.0f; style = 1;
+            } else if (localX == 3) {
+                // Nhà phố shophouse tím lavender, 4 tầng, có hàng cột sảnh đón và ki-ốt góc
+                width = 12.8f; depth = 12.2f; h = 15.0f; style = 2;
+            } else {
+                // Khối thương mại dịch vụ thấp tầng, 3 tầng, có mái đón kính
+                width = 13.5f; depth = 11.5f; h = 11.0f; style = 5;
+            }
+        }
+        // localZ == 3: HÀNG TRUNG CẢNH (CAO VỪA - CAO ỐC VĂN PHÒNG & THÁP LĂNG KÍNH PRISM)
+        else if (localZ == 3) {
+            if (localX == 1) {
+                // Tòa nhà văn phòng gạch nung terracotta với gờ mái xám than sang trọng
+                width = 14.2f; depth = 13.8f; h = 34.0f; style = 2;
+            } else if (localX == 3) {
+                // Tháp văn phòng lăng kính hiện đại (Prism Tower) với đỉnh vát góc
+                width = 14.0f; depth = 14.0f; h = 46.0f; style = 3;
+            } else {
+                // Cao ốc văn phòng thương mại trắng hiện đại có biển quảng cáo LED
+                width = 14.5f; depth = 14.0f; h = 38.0f; style = 0;
+            }
+        }
+        // localZ == 5: HÀNG HẬU CẢNH (CAO NHẤT - CỤM 4 SIÊU CAO ỐC BIỂU TƯỢNG)
+        else {
+            if (localX == 1) {
+                // Tháp gạch hoàng thổ Ochre với cột cờ tung bay trên đỉnh
+                width = 14.8f; depth = 14.2f; h = 64.0f; style = 1;
+            } else if (localX == 3) {
+                // SIÊU CAO ỐC KÍNH XANH AZURE CHỌC TRỜI (TÒA NHÀ CAO NHẤT VỚI CỘT KIM THU LÔI ANTENNA)
+                width = 16.0f; depth = 15.5f; h = 80.0f; style = 0;
+            } else {
+                // CAO ỐC BẠC CORPORATE VỚI TẦNG ÁP MÁI LAM NGỌC & BÃI ĐÁP TRỰC THĂNG (HELIPAD TOWER)
+                width = 15.5f; depth = 15.0f; h = 74.0f; style = 5;
+            }
+        }
+    }
+
     return Building{ x, z, width, depth, h, style };
 }
 
@@ -623,71 +924,182 @@ void drawCylinderWindows(float radius, float height, int style) {
     glEnd();
 }
 
+void drawRooftopHelipad(float size) {
+    glPushMatrix();
+    // Nền bãi đáp xám than
+    setMaterial(0.22f, 0.25f, 0.28f, 20.0f, 0.2f);
+    drawCylinder(size * 0.44f, 0.08f, 24);
+
+    // Vành tròn viền vàng rực
+    glTranslatef(0.0f, 0.082f, 0.0f);
+    setMaterial(0.98f, 0.80f, 0.15f, 30.0f, 0.4f);
+    drawDuctRing(size * 0.40f, size * 0.435f, 0.02f, 24);
+
+    // Chữ H màu trắng sắc nét ở tâm
+    setMaterial(0.96f, 0.98f, 1.0f, 40.0f, 0.5f);
+    float legW = size * 0.055f, legL = size * 0.44f, barW = size * 0.24f;
+    glPushMatrix();
+    glTranslatef(-barW * 0.5f, 0.01f, 0.0f);
+    glScalef(legW, 0.02f, legL);
+    glutSolidCube(1.0);
+    glPopMatrix();
+
+    glPushMatrix();
+    glTranslatef(barW * 0.5f, 0.01f, 0.0f);
+    glScalef(legW, 0.02f, legL);
+    glutSolidCube(1.0);
+    glPopMatrix();
+
+    glPushMatrix();
+    glTranslatef(0.0f, 0.01f, 0.0f);
+    glScalef(barW, 0.02f, legW);
+    glutSolidCube(1.0);
+    glPopMatrix();
+
+    // 4 Đèn viền xanh ngọc nhấp nháy góc bãi đáp
+    bool hStrobe = std::fmod(animTime, 0.8f) < 0.4f;
+    setMaterial(hStrobe ? 0.2f : 0.05f, hStrobe ? 0.95f : 0.3f, 0.85f, 80.0f, 0.9f);
+    for (int hx = -1; hx <= 1; hx += 2) {
+        for (int hz = -1; hz <= 1; hz += 2) {
+            glPushMatrix();
+            glTranslatef(hx * size * 0.41f, 0.06f, hz * size * 0.41f);
+            glScalef(0.14f, 0.08f, 0.14f);
+            glutSolidSphere(1.0, 8, 6);
+            glPopMatrix();
+        }
+    }
+    glPopMatrix();
+}
+
+/**
+ * Vẽ Biển quảng cáo màn hình LED / Neon hiện đại trên mặt đứng tòa nhà
+ */
+void drawBuildingBillboard(float w, float h, float d, int style) {
+    int seed = (int)(w * 7.0f + h * 13.0f + d * 17.0f + style);
+    int variant = std::abs(seed) % 3;
+    float boardW = std::min(w * 0.65f, 7.5f);
+    float boardH = std::min(h * 0.20f, 4.2f);
+    float boardY = -h * 0.10f;
+    float boardZ = d * 0.5f + 0.12f;
+
+    glPushMatrix();
+    glTranslatef(0.0f, boardY, boardZ);
+
+    // 1. Khung kim loại viền biển quảng cáo
+    setMaterial(0.12f, 0.14f, 0.18f, 20.0f);
+    drawCube(boardW + 0.35f, boardH + 0.35f, 0.18f);
+
+    // 2. Màn hình LED / Neon phát sáng
+    float pulse = 0.88f + 0.12f * std::sin(animTime * 3.5f + seed);
+    float r = 0.10f, g = 0.82f, b = 0.95f; // Neon Cyan
+    if (variant == 1) { r = 0.95f; g = 0.22f; b = 0.65f; } // Neon Magenta
+    else if (variant == 2) { r = 0.98f; g = 0.70f; b = 0.15f; } // Amber Gold
+
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT);
+    glDisable(GL_LIGHTING);
+
+    // Nền màn hình LED
+    glColor3f(r * pulse, g * pulse, b * pulse);
+    glBegin(GL_QUADS);
+        glVertex3f(-boardW * 0.5f, -boardH * 0.5f, 0.10f);
+        glVertex3f( boardW * 0.5f, -boardH * 0.5f, 0.10f);
+        glVertex3f( boardW * 0.5f,  boardH * 0.5f, 0.10f);
+        glVertex3f(-boardW * 0.5f,  boardH * 0.5f, 0.10f);
+    glEnd();
+
+    // Dải họa tiết đồ họa LED (thanh equalizer bars động)
+    glColor3f(1.0f, 1.0f, 1.0f);
+    int bars = 5;
+    float barSpacing = boardW / (float)(bars + 1);
+    for (int i = 0; i < bars; ++i) {
+        float barX = -boardW * 0.5f + barSpacing * (i + 1);
+        float barH = (boardH * 0.32f) * (0.35f + 0.65f * std::sin(animTime * 4.2f + i * 1.3f));
+        glBegin(GL_QUADS);
+            glVertex3f(barX - 0.20f, -boardH * 0.35f, 0.11f);
+            glVertex3f(barX + 0.20f, -boardH * 0.35f, 0.11f);
+            glVertex3f(barX + 0.20f, -boardH * 0.35f + barH, 0.11f);
+            glVertex3f(barX - 0.20f, -boardH * 0.35f + barH, 0.11f);
+        glEnd();
+    }
+
+    glPopAttrib();
+    glPopMatrix();
+}
+
 /**
  * Vẽ Tòa Nhà Procedural (Bảng màu kiến trúc thanh lịch lấy cảm hứng chính xác từ Hình 2)
  */
 void drawBuilding(const Building& b) {
-    // 6 Phong cách kiến trúc theo Hình 2:
-    // Style 0: Cao ốc Trắng sứ chọc trời (White Skyscraper - như tòa nhà cao nhất bên phải hình 2)
-    // Style 1: Tòa nhà Vàng đất hoàng thổ / Ochre (Yellow Masonry - như tòa nhà vàng ở giữa hình 2)
-    // Style 2: Tòa nhà Cam đất Terracotta (như tòa nhà cam cánh trái hình 2)
-    // Style 3: Tháp trụ tròn viễn thông Trắng muốt (Observation Needle Tower)
-    // Style 4: Tòa tháp mái xanh ngọc bích / Lam ngọc cổ điển (Teal Dome Landmark)
-    // Style 5: Cao ốc kính Bạc xám hiện đại (Silver-Grey High-rise)
     const float buildingPalette[6][3] = {
-        { 0.87f, 0.91f, 0.93f }, // Trắng bê tông
-        { 0.70f, 0.79f, 0.84f }, // Xám xanh nhạt
-        { 0.24f, 0.55f, 0.72f }, // Xanh kính
-        { 0.90f, 0.93f, 0.94f }, // Tháp trắng
-        { 0.22f, 0.66f, 0.72f }, // Lam ngọc
-        { 0.90f, 0.72f, 0.44f }  // Be ấm điểm nhấn
+        { 0.88f, 0.91f, 0.93f }, // Style 0: Trắng sứ / Kính xanh Azure
+        { 0.88f, 0.68f, 0.32f }, // Style 1: Vàng đất Ochre / Amber ấm
+        { 0.82f, 0.48f, 0.34f }, // Style 2: Terracotta / Lavender tím
+        { 0.28f, 0.65f, 0.76f }, // Style 3: Tháp lăng kính Prism
+        { 0.22f, 0.66f, 0.72f }, // Style 4: Mái lam ngọc cổ điển
+        { 0.78f, 0.82f, 0.85f }  // Style 5: Bạc Corporate / Be ấm
     };
 
     int styleIdx = b.style % 6;
-    const float* c = buildingPalette[styleIdx];
+    float colR = buildingPalette[styleIdx][0];
+    float colG = buildingPalette[styleIdx][1];
+    float colB = buildingPalette[styleIdx][2];
+
+    // Điều chỉnh màu chuyên biệt theo từng công trình trong hình mẫu:
+    if (styleIdx == 0 && b.h > 76.0f) {
+        // Tòa chọc trời kính Azure cao nhất
+        colR = 0.20f; colG = 0.58f; colB = 0.78f;
+    } else if (styleIdx == 1 && b.h < 25.0f) {
+        // Shophouse vàng amber ấm ở mặt tiền
+        colR = 0.92f; colG = 0.74f; colB = 0.36f;
+    } else if (styleIdx == 2 && b.h < 20.0f) {
+        // Shophouse tím lavender ở mặt tiền
+        colR = 0.68f; colG = 0.62f; colB = 0.78f;
+    } else if (styleIdx == 5 && b.h < 15.0f) {
+        // Khối thương mại dịch vụ thấp tầng mặt tiền
+        colR = 0.86f; colG = 0.82f; colB = 0.72f;
+    }
+
     bool detailed = std::fabs(b.x - drone.x) < 95.0f && std::fabs(b.z - drone.z) < 145.0f;
 
     glPushMatrix();
     glTranslatef(b.x, b.h * 0.5f - 0.25f, b.z);
-    // Hạn chế độ bóng gương để các mặt nhà có màu phẳng, sáng như minh họa vector.
-    setMaterial(c[0], c[1], c[2], 12.0f, 0.12f);
+    setMaterial(colR, colG, colB, 14.0f, 0.15f);
 
     if (styleIdx == 3) {
-        // THÁP TRỤ TRÒN VIỄN THÔNG (Observation Needle Tower như hình 2)
-        float radius = std::min(b.w, b.d) * 0.44f;
-        glPushMatrix();
-        glTranslatef(0.0f, -b.h * 0.5f, 0.0f);
-        drawCylinder(radius, b.h, 32);
-        glPopMatrix();
-
+        // THÁP VĂN PHÒNG LĂNG KÍNH (PRISM TOWER NHƯ HÌNH MẪU)
+        drawCube(b.w, b.h, b.d);
         if (detailed) {
-            drawCylinderWindows(radius, b.h, b.style);
+            drawCleanWindows(b.w, b.h, b.d, b.style);
         }
-
-        // Vành đai đài quan sát xám đen gần đỉnh tháp
-        setMaterial(0.32f, 0.43f, 0.49f, 8.0f, 0.05f);
-        glPushMatrix();
-        glTranslatef(0.0f, b.h * 0.38f, 0.0f);
-        drawCylinder(radius * 1.15f, 2.5f, 24);
-        glPopMatrix();
-
-        // Cột kim thu lôi nhọn vút trên đỉnh
-        setMaterial(0.92f, 0.94f, 0.96f, 60.0f);
+        // Đỉnh vát góc lăng kính hiện đại (Angled Faceted Crown)
         glPushMatrix();
         glTranslatef(0.0f, b.h * 0.5f, 0.0f);
-        drawCone(radius * 0.6f, 5.5f, 18);
-        glTranslatef(0.0f, 5.5f, 0.0f);
-        drawCylinder(0.15f, 7.0f, 10);
+        setMaterial(0.22f, 0.60f, 0.72f, 40.0f, 0.35f);
+        float hw = b.w * 0.5f, hd = b.d * 0.5f, wedgeH = 4.8f;
+        glBegin(GL_TRIANGLES);
+            glNormal3f(0.0f, 0.6f, -0.8f);
+            glVertex3f(-hw, 0.0f, -hd);
+            glVertex3f( hw, 0.0f, -hd);
+            glVertex3f(  0.0f, wedgeH, hd);
+
+            glNormal3f(0.8f, 0.6f, 0.0f);
+            glVertex3f( hw, 0.0f, -hd);
+            glVertex3f( hw, 0.0f,  hd);
+            glVertex3f(  0.0f, wedgeH, hd);
+
+            glNormal3f(-0.8f, 0.6f, 0.0f);
+            glVertex3f(-hw, 0.0f,  hd);
+            glVertex3f(-hw, 0.0f, -hd);
+            glVertex3f(  0.0f, wedgeH, hd);
+        glEnd();
         glPopMatrix();
 
     } else if (styleIdx == 4) {
-        // TÒA THÁP MÁI XANH NGỌC LAM CỔ ĐIỂN (Teal Dome Landmark như hình 2)
+        // TÒA THÁP MÁI XANH NGỌC LAM CỔ ĐIỂN
         drawCube(b.w, b.h * 0.80f, b.d);
         if (detailed) {
             drawCleanWindows(b.w, b.h * 0.80f, b.d, b.style);
         }
-
-        // Tầng áp mái và Mái Vòm Xanh Ngọc Lam (Teal Dome)
         setMaterial(0.15f, 0.52f, 0.62f, 10.0f, 0.08f);
         glPushMatrix();
         glTranslatef(0.0f, b.h * 0.40f + 1.2f, 0.0f);
@@ -697,59 +1109,187 @@ void drawBuilding(const Building& b) {
         glPopMatrix();
 
     } else if (styleIdx == 1) {
-        // TÒA NHÀ VÀNG ĐẤT OCHRE (Yellow Brick Building như hình 2)
+        // TÒA NHÀ VÀNG ĐẤT OCHRE / AMBER
         drawCube(b.w, b.h, b.d);
         if (detailed) {
             drawCleanWindows(b.w, b.h, b.d, b.style);
         }
 
-        // Gờ mái màu nâu gạch sẫm
-        setMaterial(0.43f, 0.57f, 0.64f, 8.0f, 0.05f);
-        glPushMatrix();
-        glTranslatef(0.0f, b.h * 0.5f + 0.2f, 0.0f);
-        drawCube(b.w * 0.98f, 0.4f, b.d * 0.98f);
-        glPopMatrix();
+        if (b.h > 50.0f) {
+            // THÁP OCHRE CÓ CỘT CỜ TRÊN ĐỈNH (FLAGPOLE TOWER NHƯ HÌNH MẪU)
+            setMaterial(0.75f, 0.55f, 0.22f, 20.0f);
+            glPushMatrix();
+            glTranslatef(0.0f, b.h * 0.5f + 0.35f, 0.0f);
+            drawCube(b.w * 0.88f, 0.70f, b.d * 0.88f);
+            glPopMatrix();
 
-        // Khối phòng kỹ thuật trên sân thượng
-        setMaterial(0.85f, 0.68f, 0.20f, 30.0f);
-        glPushMatrix();
-        glTranslatef(-b.w * 0.15f, b.h * 0.5f + 1.0f, -b.d * 0.15f);
-        drawCube(b.w * 0.35f, 1.6f, b.d * 0.35f);
-        glPopMatrix();
+            // Cột cờ và lá cờ tung bay trong gió
+            glPushMatrix();
+            glTranslatef(0.0f, b.h * 0.5f + 0.7f, 0.0f);
+            setMaterial(0.85f, 0.88f, 0.90f, 60.0f);
+            drawCylinder(0.12f, 8.5f, 10);
+            float flagWave = std::sin(animTime * 4.5f) * 0.28f;
+            setMaterial(0.20f, 0.55f, 0.85f, 20.0f);
+            glBegin(GL_TRIANGLES);
+                glNormal3f(0.0f, 0.0f, 1.0f);
+                glVertex3f(0.0f, 8.2f, 0.0f);
+                glVertex3f(2.6f, 7.6f, flagWave);
+                glVertex3f(0.0f, 7.0f, 0.0f);
+            glEnd();
+            glPopMatrix();
+
+        } else {
+            // TÒA BOUTIQUE VÀNG AMBER MẶT TIỀN (CÓ KHỐI PENTHOUSE VÒM & MÁI CHE)
+            setMaterial(0.78f, 0.42f, 0.46f, 20.0f);
+            glPushMatrix();
+            glTranslatef(0.0f, b.h * 0.5f + 0.6f, 0.0f);
+            glScalef(b.w * 0.32f, 1.2f, b.d * 0.22f);
+            glutSolidSphere(1.0, 16, 12);
+            glPopMatrix();
+
+            // Mái che cửa hàng vươn ra lối đi bộ
+            glPushMatrix();
+            glTranslatef(0.0f, -b.h * 0.5f + 2.8f, b.d * 0.5f + 0.6f);
+            setMaterial(0.22f, 0.50f, 0.75f, 15.0f);
+            glBegin(GL_QUADS);
+                glNormal3f(0.0f, 0.7f, 0.7f);
+                glVertex3f(-b.w * 0.45f, 0.3f, -0.6f);
+                glVertex3f( b.w * 0.45f, 0.3f, -0.6f);
+                glVertex3f( b.w * 0.45f, -0.2f, 0.7f);
+                glVertex3f(-b.w * 0.45f, -0.2f, 0.7f);
+            glEnd();
+            glPopMatrix();
+        }
 
     } else if (styleIdx == 2) {
-        // TÒA NHÀ CAM TERRCOTTA VỚI GỜ MÁI XÁM (như hình 2)
+        // TÒA NHÀ TERRACOTTA / TÍM LAVENDER
         drawCube(b.w, b.h, b.d);
         if (detailed) {
             drawCleanWindows(b.w, b.h, b.d, b.style);
         }
 
-        // Mái vát hoặc chóp nhọn màu xám than sang trọng
-        setMaterial(0.16f, 0.34f, 0.43f, 8.0f, 0.05f);
-        glPushMatrix();
-        glTranslatef(0.0f, b.h * 0.5f + 1.2f, 0.0f);
-        drawCube(b.w * 0.95f, 2.4f, b.d * 0.95f);
-        glPopMatrix();
+        if (b.h < 20.0f) {
+            // NHÀ PHỐ SHOPHOUSE TÍM LAVENDER (CÓ HÀNG CỘT SẢNH ĐÓN & KI-ỐT GÓC)
+            glPushMatrix();
+            glTranslatef(0.0f, -b.h * 0.5f, b.d * 0.5f + 0.45f);
+            setMaterial(0.92f, 0.94f, 0.95f, 20.0f);
+            glPushMatrix();
+            glTranslatef(0.0f, 3.2f, 0.0f);
+            drawCube(b.w * 0.55f, 0.50f, 1.0f);
+            glPopMatrix();
+            for (int col = -1; col <= 1; col += 2) {
+                glPushMatrix();
+                glTranslatef(col * b.w * 0.22f, 0.0f, 0.35f);
+                drawCylinder(0.20f, 3.0f, 12);
+                glPopMatrix();
+            }
+            glPopMatrix();
+
+            // Ki-ốt phụ góc phố
+            setMaterial(0.85f, 0.78f, 0.65f, 10.0f);
+            glPushMatrix();
+            glTranslatef(b.w * 0.42f + 1.2f, -b.h * 0.5f + 2.5f, 0.0f);
+            drawCube(2.4f, 5.0f, b.d * 0.7f);
+            glPopMatrix();
+
+        } else {
+            // TÒA NHÀ VĂN PHÒNG TERRACOTTA GỜ MÁI XÁM THAN
+            setMaterial(0.22f, 0.25f, 0.28f, 15.0f, 0.1f);
+            glPushMatrix();
+            glTranslatef(0.0f, b.h * 0.5f + 0.25f, 0.0f);
+            drawCube(b.w * 0.96f, 0.50f, b.d * 0.96f);
+            glPopMatrix();
+        }
 
     } else {
-        // CAO ỐC TRẮNG SỨ CHỌC TRỜI (Style 0 & 5 - Như tòa cao nhất bên phải hình 2)
+        // STYLE 0 & 5: SIÊU CAO ỐC KÍNH XANH AZURE HOẶC CAO ỐC BẠC CORPORATE
         drawCube(b.w, b.h, b.d);
         if (detailed) {
             drawCleanWindows(b.w, b.h, b.d, b.style);
         }
 
-        // Cột ăng-ten trắng vút cao trên nóc
-        setMaterial(0.95f, 0.96f, 0.98f, 50.0f);
         float roofY = b.h * 0.5f + 0.02f;
-        glPushMatrix();
-        glTranslatef(0.0f, roofY, 0.0f);
-        drawCube(b.w * 0.96f, 0.4f, b.d * 0.96f);
-        glPopMatrix();
 
-        // Cột anten cao trên đỉnh tòa nhà trắng
+        if (styleIdx == 0 && b.h > 76.0f) {
+            // SIÊU CAO ỐC AZURE SPIRE SKYSCRAPER (TÒA CAO NHẤT CÓ KIM THU LÔI VÚT CAO)
+            glPushMatrix();
+            glTranslatef(0.0f, roofY, 0.0f);
+            setMaterial(0.85f, 0.90f, 0.94f, 40.0f);
+            drawCube(b.w * 0.65f, 2.0f, b.d * 0.65f);
+
+            glTranslatef(0.0f, 1.0f, 0.0f);
+            setMaterial(0.92f, 0.94f, 0.96f, 60.0f);
+            drawCone(1.3f, 11.5f, 16);
+            glTranslatef(0.0f, 11.5f, 0.0f);
+            drawCylinder(0.12f, 3.5f, 8);
+
+            bool spireBlink = std::fmod(animTime, 1.0f) < 0.5f;
+            if (spireBlink) {
+                setMaterial(1.0f, 0.15f, 0.15f, 100.0f, 1.0f);
+                GLfloat glow[] = { 1.0f, 0.15f, 0.15f, 1.0f };
+                glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, glow);
+            } else {
+                setMaterial(0.35f, 0.05f, 0.05f, 10.0f);
+            }
+            glTranslatef(0.0f, 3.5f, 0.0f);
+            glScalef(0.30f, 0.30f, 0.30f);
+            glutSolidSphere(1.0, 10, 8);
+            glPopMatrix();
+
+        } else if (styleIdx == 5 && b.h > 65.0f) {
+            // CAO ỐC BẠC CORPORATE VỚI TẦNG ÁP MÁI LAM NGỌC & BÃI ĐÁP TRỰC THĂNG
+            setMaterial(0.22f, 0.65f, 0.70f, 30.0f, 0.3f);
+            glPushMatrix();
+            glTranslatef(0.0f, roofY + 1.2f, 0.0f);
+            drawCube(b.w * 0.85f, 2.4f, b.d * 0.85f);
+            glPopMatrix();
+
+            // Kiểm tra chính xác 2 tòa nhà Landmark Helipad
+            bool isHelipad = (std::abs(b.x - HELIPAD_1_X) < 2.0f && std::abs(b.z - HELIPAD_1_Z) < 2.0f) ||
+                             (std::abs(b.x - HELIPAD_2_X) < 2.0f && std::abs(b.z - HELIPAD_2_Z) < 2.0f);
+            if (isHelipad) {
+                glPushMatrix();
+                glTranslatef(0.0f, roofY + 2.45f, 0.0f);
+                drawRooftopHelipad(std::min(b.w, b.d) * 0.75f);
+                glPopMatrix();
+            }
+
+        } else if (styleIdx == 5 && b.h < 15.0f) {
+            // KHỐI THƯƠNG MẠI DỊCH VỤ THẤP TẦNG (CÓ MÁI ĐÓN KÍNH)
+            setMaterial(0.20f, 0.50f, 0.70f, 30.0f);
+            glPushMatrix();
+            glTranslatef(0.0f, -b.h * 0.5f + 2.8f, b.d * 0.5f + 0.5f);
+            drawCube(b.w * 0.65f, 0.20f, 1.2f);
+            glPopMatrix();
+
+        } else {
+            // TÒA NHÀ TRẮNG HIỆN ĐẠI TIÊU CHUẨN
+            setMaterial(0.95f, 0.96f, 0.98f, 50.0f);
+            glPushMatrix();
+            glTranslatef(0.0f, roofY, 0.0f);
+            drawCube(b.w * 0.96f, 0.4f, b.d * 0.96f);
+            glPopMatrix();
+        }
+    }
+
+    // Đèn tín hiệu hàng không chớp đỏ cảnh báo trên nóc các tòa cao ốc
+    if (b.h > 34.0f && styleIdx != 3) {
         glPushMatrix();
-        glTranslatef(b.w * 0.20f, roofY + 3.0f, 0.0f);
-        drawCylinder(0.20f, 6.0f, 12);
+        glTranslatef(b.w * 0.22f, b.h * 0.5f + 0.2f, b.d * 0.22f);
+        setMaterial(0.72f, 0.76f, 0.80f, 40.0f, 0.5f);
+        drawCylinder(0.10f, 5.5f, 10);
+
+        bool beaconBlink = std::fmod(animTime, 1.0f) < 0.5f;
+        if (beaconBlink) {
+            setMaterial(1.0f, 0.15f, 0.15f, 100.0f, 1.0f);
+            GLfloat glow[] = { 1.0f, 0.15f, 0.15f, 1.0f };
+            glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, glow);
+        } else {
+            setMaterial(0.35f, 0.05f, 0.05f, 10.0f, 0.1f);
+        }
+        glTranslatef(0.0f, 5.5f, 0.0f);
+        glScalef(0.24f, 0.24f, 0.24f);
+        glutSolidSphere(1.0, 10, 8);
         glPopMatrix();
     }
 
@@ -770,6 +1310,11 @@ void drawBuilding(const Building& b) {
         }
     }
 
+    // Biển quảng cáo màn hình LED Neon cho các tòa nhà cao tầng
+    if (b.h > 24.0f && (styleIdx == 1 || styleIdx == 2 || styleIdx == 5)) {
+        drawBuildingBillboard(b.w, b.h, b.d, b.style);
+    }
+
     glPopMatrix();
 }
 
@@ -781,6 +1326,24 @@ bool sphereAabbHit(const Vec3& p, float radius, const Building& b) {
     float qz = clampf(p.z, b.z - halfZ, b.z + halfZ);
     Vec3 d = p - Vec3(qx, qy, qz);
     return dot(d, d) < radius * radius;
+}
+
+bool checkBuildingHitAndResolve(const Vec3& p, float radius, const Building& b, Vec3& outNormal, float& outDist) {
+    float halfX = b.w * 0.5f, halfZ = b.d * 0.5f;
+    if (b.style == 3) halfX = halfZ = std::min(b.w, b.d) * 0.44f;
+    float qx = clampf(p.x, b.x - halfX, b.x + halfX);
+    float qy = clampf(p.y, -0.25f, b.h - 0.25f);
+    float qz = clampf(p.z, b.z - halfZ, b.z + halfZ);
+    Vec3 d = p - Vec3(qx, qy, qz);
+    float distSq = dot(d, d);
+    float dist = std::sqrt(distSq);
+    outDist = dist;
+    if (distSq < radius * radius) {
+        if (dist > 1e-4f) outNormal = d * (1.0f / dist);
+        else outNormal = Vec3(0, 1, 0);
+        return true;
+    }
+    return false;
 }
 
 // =========================================================================================
@@ -800,58 +1363,349 @@ void drawPowerSpan(const Vec3& a, const Vec3& b, float y, float sag) {
 void drawUtilityPole(float x, float z, bool roadRunsAlongZ) {
     glPushMatrix();
     glTranslatef(x, -0.28f, z);
-    // Cột đèn đen đơn giản, hợp với minh họa phố dạng mô hình.
-    setMaterial(0.12f, 0.14f, 0.17f, 4.0f, 0.0f);
-    drawCylinder(0.10f, 5.6f, 10);
+
+    // Chân cột đế vuông và thân trụ xám than hiện đại
+    setMaterial(0.20f, 0.22f, 0.26f, 45.0f, 0.5f);
     glPushMatrix();
-    glTranslatef(0.0f, 5.25f, 0.0f);
-    if (roadRunsAlongZ) drawCube(0.85f, 0.10f, 0.12f);
-    else                drawCube(0.12f, 0.10f, 0.85f);
+    glTranslatef(0.0f, 0.15f, 0.0f);
+    drawCube(0.42f, 0.30f, 0.42f);
+    glPopMatrix();
+    drawCylinder(0.12f, 6.2f, 12);
+
+    // Cần đèn chữ L vươn ra lòng đường
+    glPushMatrix();
+    glTranslatef(0.0f, 6.0f, 0.0f);
+    if (roadRunsAlongZ) {
+        glTranslatef(0.70f, 0.0f, 0.0f);
+        drawCube(1.45f, 0.10f, 0.12f);
+        glTranslatef(0.65f, -0.15f, 0.0f);
+    } else {
+        glTranslatef(0.0f, 0.0f, 0.70f);
+        drawCube(0.12f, 0.10f, 1.45f);
+        glTranslatef(0.0f, -0.15f, 0.65f);
+    }
+
+    // Chụp đèn LED hiện đại
+    setMaterial(0.14f, 0.16f, 0.20f, 60.0f, 0.5f);
+    glPushMatrix();
+    glScalef(0.38f, 0.12f, 0.38f);
+    glutSolidCube(1.0);
     glPopMatrix();
 
-    setMaterial(1.0f, 0.91f, 0.55f, 3.0f, 0.0f);
+    // Mặt kính LED phát sáng
+    setMaterial(1.0f, 0.95f, 0.65f, 5.0f, 0.0f);
     if (nightFactor > 0.02f) {
-        GLfloat glow[] = { nightFactor * 0.95f, nightFactor * 0.60f, nightFactor * 0.18f, 1.0f };
+        GLfloat glow[] = { nightFactor * 1.0f, nightFactor * 0.85f, nightFactor * 0.45f, 1.0f };
         glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, glow);
     }
     glPushMatrix();
-    glTranslatef(0.0f, 5.35f, 0.0f);
-    glScalef(0.20f, 0.11f, 0.20f);
+    glTranslatef(0.0f, -0.06f, 0.0f);
+    glScalef(0.28f, 0.06f, 0.28f);
     glutSolidSphere(1.0, 10, 8);
     glPopMatrix();
+
+    glPopMatrix();
+
+    // Vệt sáng vàng ấm rọi mặt đường vào ban đêm
+    if (nightFactor > 0.05f) {
+        glPushMatrix();
+        glTranslatef(roadRunsAlongZ ? 1.35f : 0.0f, 0.02f, roadRunsAlongZ ? 0.0f : 1.35f);
+        glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_LIGHTING);
+        glColor4f(1.0f, 0.88f, 0.45f, nightFactor * 0.20f);
+        glBegin(GL_TRIANGLE_FAN);
+            glVertex3f(0.0f, 0.0f, 0.0f);
+            for (int i = 0; i <= 16; ++i) {
+                float a = 2.0f * PI * i / 16.0f;
+                glColor4f(1.0f, 0.82f, 0.35f, 0.0f);
+                glVertex3f(std::cos(a) * 4.4f, 0.0f, std::sin(a) * 4.4f);
+            }
+        glEnd();
+        glPopAttrib();
+        glPopMatrix();
+    }
+
     glPopMatrix();
 }
 
-/** Dựng cây tán tròn low-poly, đồng bộ với các hàng cây trong mẫu đường phố. */
+/** Dựng cây xanh đô thị 3 phong cách (tán rộng đa tầng, tùng búp, cây anh đào phong) */
 void drawStylizedTree(float x, float z, int variant) {
     glPushMatrix();
     glTranslatef(x, -0.28f, z);
-    setMaterial(0.38f, 0.24f, 0.14f, 4.0f, 0.0f);
-    drawCylinder(0.18f, 3.8f, 10);
 
-    setMaterial(variant == 0 ? 0.18f : 0.14f,
-                variant == 0 ? 0.58f : 0.48f,
-                variant == 0 ? 0.12f : 0.10f, 4.0f, 0.0f);
+    // Bồn cây viền đá bao quanh gốc cây
+    setMaterial(0.60f, 0.63f, 0.66f, 15.0f, 0.1f);
     glPushMatrix();
-    glTranslatef(0.0f, 4.7f, 0.0f);
-    glScalef(1.38f, 1.42f, 1.38f);
-    glutSolidSphere(1.0, 12, 9);
+    glTranslatef(0.0f, 0.08f, 0.0f);
+    drawDuctRing(1.15f, 1.40f, 0.16f, 16);
+    glPopMatrix();
+    // Đất trồng màu nâu ấm
+    setMaterial(0.28f, 0.18f, 0.10f, 5.0f, 0.0f);
+    glPushMatrix();
+    glTranslatef(0.0f, 0.06f, 0.0f);
+    glScalef(1.15f, 0.05f, 1.15f);
+    glutSolidCube(1.0);
     glPopMatrix();
 
-    setMaterial(variant == 0 ? 0.28f : 0.22f,
-                variant == 0 ? 0.70f : 0.60f,
-                variant == 0 ? 0.16f : 0.12f, 4.0f, 0.0f);
+    // Thân cây gỗ tự nhiên
+    setMaterial(0.36f, 0.23f, 0.13f, 6.0f, 0.04f);
+    drawCylinder(0.22f, 4.2f, 12);
+
+    if (variant == 0) {
+        // KIỂU 1: CÂY ĐÔ THỊ 3 TẦNG TÁN LÁ XANH MẠ TƯƠI MÁT
+        setMaterial(0.18f, 0.58f, 0.16f, 8.0f, 0.05f);
+        glPushMatrix();
+        glTranslatef(0.0f, 4.0f, 0.0f);
+        glScalef(1.85f, 1.25f, 1.85f);
+        glutSolidSphere(1.0, 14, 10);
+        glPopMatrix();
+
+        setMaterial(0.28f, 0.70f, 0.22f, 10.0f, 0.08f);
+        glPushMatrix();
+        glTranslatef(0.35f, 4.95f, 0.22f);
+        glScalef(1.45f, 1.15f, 1.45f);
+        glutSolidSphere(1.0, 12, 9);
+        glPopMatrix();
+
+        setMaterial(0.38f, 0.82f, 0.26f, 12.0f, 0.10f);
+        glPushMatrix();
+        glTranslatef(-0.20f, 5.75f, -0.15f);
+        glScalef(1.05f, 0.95f, 1.05f);
+        glutSolidSphere(1.0, 10, 8);
+        glPopMatrix();
+
+    } else if (variant == 1) {
+        // KIỂU 2: CÂY TÙNG BÚT / THÔNG CẢNH QUAN 3 TẦNG CHÓP
+        for (int tier = 0; tier < 3; ++tier) {
+            float ty = 2.8f + tier * 1.55f;
+            float tr = 1.75f - tier * 0.42f;
+            setMaterial(0.10f + tier * 0.05f, 0.42f + tier * 0.07f, 0.18f, 8.0f, 0.04f);
+            glPushMatrix();
+            glTranslatef(0.0f, ty, 0.0f);
+            drawCone(tr, 2.3f, 14);
+            glPopMatrix();
+        }
+    } else {
+        // KIỂU 3: CÂY PHONG / HOA ANH ĐÀO SẮC CAM HỒNG ẤM ÁP
+        setMaterial(0.92f, 0.48f, 0.35f, 10.0f, 0.08f);
+        glPushMatrix();
+        glTranslatef(0.0f, 4.1f, 0.0f);
+        glScalef(1.75f, 1.30f, 1.75f);
+        glutSolidSphere(1.0, 14, 10);
+        glPopMatrix();
+
+        setMaterial(0.98f, 0.66f, 0.46f, 12.0f, 0.10f);
+        glPushMatrix();
+        glTranslatef(0.30f, 5.05f, -0.20f);
+        glScalef(1.30f, 1.10f, 1.30f);
+        glutSolidSphere(1.0, 12, 9);
+        glPopMatrix();
+    }
+
+    glPopMatrix();
+}
+
+// Trạng thái chu kỳ đèn tín hiệu giao thông (Tổng chu kỳ: 14 giây)
+inline bool isTrafficGreenForZ(float t) {
+    float cycle = std::fmod(t, 14.0f);
+    return cycle < 5.8f;
+}
+inline bool isTrafficYellowForZ(float t) {
+    float cycle = std::fmod(t, 14.0f);
+    return cycle >= 5.8f && cycle < 7.0f;
+}
+inline bool isTrafficGreenForX(float t) {
+    float cycle = std::fmod(t, 14.0f);
+    return cycle >= 7.0f && cycle < 12.8f;
+}
+inline bool isTrafficYellowForX(float t) {
+    float cycle = std::fmod(t, 14.0f);
+    return cycle >= 12.8f;
+}
+
+/**
+ * Vẽ Cột đèn giao thông hiện đại kiểu cần vươn (Cantilever mast arm) tại góc ngã tư
+ * headingDir:
+ *   0: Đón dòng xe đi hướng +Z (mặt đèn nhìn về -Z)
+ *   1: Đón dòng xe đi hướng -Z (mặt đèn nhìn về +Z)
+ *   2: Đón dòng xe đi hướng +X (mặt đèn nhìn về -X)
+ *   3: Đón dòng xe đi hướng -X (mặt đèn nhìn về +X)
+ */
+void drawModernTrafficLight(float x, float z, int headingDir) {
     glPushMatrix();
-    glTranslatef(0.42f, 5.05f, 0.16f);
-    glScalef(0.86f, 0.90f, 0.86f);
+    glTranslatef(x, -0.28f, z);
+
+    float rotY = 0.0f;
+    if (headingDir == 1) rotY = 180.0f;
+    else if (headingDir == 2) rotY = 90.0f;
+    else if (headingDir == 3) rotY = -90.0f;
+    glRotatef(rotY, 0.0f, 1.0f, 0.0f);
+
+    // 1. Thân cột thép xám than chịu lực
+    setMaterial(0.14f, 0.16f, 0.19f, 60.0f, 0.6f);
+    drawCylinder(0.12f, 5.2f, 10);
+
+    // Cần vươn ngang ra mép làn xe
+    glPushMatrix();
+    glTranslatef(-0.6f, 4.8f, 0.0f);
+    glRotatef(90.0f, 0.0f, 0.0f, 1.0f);
+    drawCylinder(0.08f, 1.2f, 8);
+    glPopMatrix();
+
+    // 2. Hộp đèn giao thông (Signal Head)
+    glPushMatrix();
+    glTranslatef(-1.15f, 4.4f, 0.0f);
+    setMaterial(0.10f, 0.11f, 0.13f, 50.0f, 0.2f);
+    glScalef(0.32f, 1.25f, 0.38f);
+    glutSolidCube(1.0);
+    glPopMatrix();
+
+    // Xác định màu đèn theo chu kỳ
+    bool isGreen = false, isYellow = false, isRed = false;
+    if (headingDir == 0 || headingDir == 1) {
+        isGreen = isTrafficGreenForZ(animTime);
+        isYellow = isTrafficYellowForZ(animTime);
+        isRed = !isGreen && !isYellow;
+    } else {
+        isGreen = isTrafficGreenForX(animTime);
+        isYellow = isTrafficYellowForX(animTime);
+        isRed = !isGreen && !isYellow;
+    }
+
+    // 3. Ba bóng đèn: Đỏ (trên), Vàng (giữa), Xanh (dưới)
+    float lightZ = -0.19f;
+
+    // Đèn đỏ (trên)
+    if (isRed) {
+        setMaterial(1.0f, 0.08f, 0.08f, 100.0f, 1.0f);
+        GLfloat glow[] = { 1.0f, 0.08f, 0.08f, 1.0f };
+        glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, glow);
+    } else {
+        setMaterial(0.20f, 0.04f, 0.04f, 20.0f, 0.0f);
+    }
+    glPushMatrix();
+    glTranslatef(-1.15f, 4.78f, lightZ);
+    glScalef(0.10f, 0.10f, 0.06f);
     glutSolidSphere(1.0, 10, 8);
     glPopMatrix();
+
+    // Đèn vàng (giữa)
+    if (isYellow) {
+        setMaterial(1.0f, 0.85f, 0.05f, 100.0f, 1.0f);
+        GLfloat glow[] = { 1.0f, 0.85f, 0.05f, 1.0f };
+        glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, glow);
+    } else {
+        setMaterial(0.20f, 0.18f, 0.03f, 20.0f, 0.0f);
+    }
+    glPushMatrix();
+    glTranslatef(-1.15f, 4.40f, lightZ);
+    glScalef(0.10f, 0.10f, 0.06f);
+    glutSolidSphere(1.0, 10, 8);
+    glPopMatrix();
+
+    // Đèn xanh (dưới)
+    if (isGreen) {
+        setMaterial(0.05f, 1.0f, 0.20f, 100.0f, 1.0f);
+        GLfloat glow[] = { 0.05f, 1.0f, 0.20f, 1.0f };
+        glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, glow);
+    } else {
+        setMaterial(0.03f, 0.20f, 0.06f, 20.0f, 0.0f);
+    }
+    glPushMatrix();
+    glTranslatef(-1.15f, 4.02f, lightZ);
+    glScalef(0.10f, 0.10f, 0.06f);
+    glutSolidSphere(1.0, 10, 8);
+    glPopMatrix();
+
+    glPopMatrix();
+}
+
+/**
+ * Vẽ Trạm chờ xe buýt hiện đại với mái kính cường lực và hộp đèn lộ trình
+ */
+void drawBusShelter(float x, float z, bool faceZ) {
+    glPushMatrix();
+    glTranslatef(x, -0.28f, z);
+    if (!faceZ) glRotatef(90.0f, 0.0f, 1.0f, 0.0f);
+
+    // 1. Đế bê tông vỉa hè
+    setMaterial(0.70f, 0.72f, 0.75f, 10.0f);
+    glPushMatrix();
+    glTranslatef(0.0f, 0.05f, 0.0f);
+    drawCube(5.4f, 0.10f, 2.2f);
+    glPopMatrix();
+
+    // 2. Cột thép chịu lực màu xám than
+    setMaterial(0.18f, 0.20f, 0.24f, 30.0f);
+    for (int sx = -1; sx <= 1; sx += 2) {
+        glPushMatrix();
+        glTranslatef(sx * 2.2f, 1.4f, -0.85f);
+        drawCylinder(0.08f, 2.7f, 10);
+        glPopMatrix();
+    }
+
+    // 3. Mái che kính vòm cong hiện đại
+    setMaterial(0.18f, 0.20f, 0.24f, 30.0f);
+    glPushMatrix();
+    glTranslatef(0.0f, 2.75f, -0.1f);
+    drawCube(5.6f, 0.12f, 2.4f);
+    glPopMatrix();
+
+    // 4. Vách kính cường lực trong suốt phía sau
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_LIGHTING);
+    glColor4f(0.35f, 0.65f, 0.85f, 0.38f);
+    glBegin(GL_QUADS);
+        glVertex3f(-2.1f, 0.15f, -0.85f);
+        glVertex3f( 2.1f, 0.15f, -0.85f);
+        glVertex3f( 2.1f, 2.65f, -0.85f);
+        glVertex3f(-2.1f, 2.65f, -0.85f);
+    glEnd();
+    glPopAttrib();
+
+    // 5. Ghế chờ cho hành khách
+    setMaterial(0.55f, 0.35f, 0.20f, 5.0f);
+    glPushMatrix();
+    glTranslatef(0.0f, 0.50f, -0.50f);
+    drawCube(3.4f, 0.10f, 0.60f);
+    glPopMatrix();
+    // Chân ghế
+    setMaterial(0.15f, 0.15f, 0.18f, 20.0f);
+    for (int leg = -1; leg <= 1; leg += 2) {
+        glPushMatrix();
+        glTranslatef(leg * 1.3f, 0.25f, -0.50f);
+        drawCube(0.12f, 0.45f, 0.45f);
+        glPopMatrix();
+    }
+
+    // 6. Biển thông tin tuyến xe buýt phát sáng
+    glPushMatrix();
+    glTranslatef(2.35f, 1.4f, -0.85f);
+    setMaterial(0.15f, 0.18f, 0.22f, 20.0f);
+    drawCube(0.12f, 1.8f, 0.95f);
+    // Hộp đèn LED thông tin
+    float busPulse = 0.9f + 0.1f * std::sin(animTime * 2.0f);
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT);
+    glDisable(GL_LIGHTING);
+    glColor3f(0.95f * busPulse, 0.85f * busPulse, 0.25f * busPulse);
+    glBegin(GL_QUADS);
+        glVertex3f(-0.07f, -0.7f, -0.4f);
+        glVertex3f(-0.07f,  0.7f, -0.4f);
+        glVertex3f(-0.07f,  0.7f,  0.4f);
+        glVertex3f(-0.07f, -0.7f,  0.4f);
+    glEnd();
+    glPopAttrib();
+    glPopMatrix();
+
     glPopMatrix();
 }
 
 void drawStreetProps(const Vec3& center) {
-    // Đèn và cây được đặt theo từng đoạn đại lộ 105 m, thay vì bước 68 m lệch lưới.
-    // Nhờ vậy cây nằm trên dải xanh sau vỉa hè, không chạm mặt đường hay vạch sang đường.
     const float avenue = CITY_GRID_SPACING * 6.0f;
     int gx0 = std::max(CITY_MIN_ROAD_INDEX, (int)std::floor((center.x - 175) / CITY_GRID_SPACING));
     int gx1 = std::min(CITY_MAX_ROAD_INDEX, (int)std::floor((center.x + 175) / CITY_GRID_SPACING));
@@ -870,9 +1724,12 @@ void drawStreetProps(const Vec3& center) {
                 float treeX = roadX + side * 11.5f;
                 drawUtilityPole(roadX + side * 9.6f, zBase + 26.25f, true);
                 drawUtilityPole(roadX + side * 9.6f, zBase + 78.75f, true);
-                if ((seg + gx + side) % 2 == 0) {
-                    drawStylizedTree(treeX, zBase + 52.5f, std::abs(seg + gx) % 2);
-                }
+                drawStylizedTree(treeX, zBase + 52.5f, std::abs(seg * 3 + gx + side) % 3);
+            }
+
+            // Trạm chờ xe buýt hiện đại bên lề đại lộ
+            if (gx % 2 == 0) {
+                drawBusShelter(roadX + 11.8f, zBase + 45.0f, true);
             }
         }
     }
@@ -889,40 +1746,94 @@ void drawStreetProps(const Vec3& center) {
                 float treeZ = roadZ + side * 11.5f;
                 drawUtilityPole(xBase + 26.25f, roadZ + side * 9.6f, false);
                 drawUtilityPole(xBase + 78.75f, roadZ + side * 9.6f, false);
-                if ((seg + gz + side) % 2 == 0) {
-                    drawStylizedTree(xBase + 52.5f, treeZ, std::abs(seg + gz) % 2);
-                }
+                drawStylizedTree(xBase + 52.5f, treeZ, std::abs(seg * 3 + gz + side) % 3);
             }
+        }
+    }
+
+    // CỘT ĐÈN GIAO THÔNG ĐẦY ĐỦ CHO TẤT CẢ CÁC HƯỚNG TẠI MỖI NGÃ TƯ
+    int ix0 = std::max(CITY_MIN_DISTRICT, (int)std::floor((center.x - 190.0f) / avenue) - 1);
+    int ix1 = std::min(CITY_MAX_DISTRICT + 1, (int)std::floor((center.x + 190.0f) / avenue) + 1);
+    int iz0 = std::max(CITY_MIN_DISTRICT, (int)std::floor((center.z - 190.0f) / avenue) - 1);
+    int iz1 = std::min(CITY_MAX_DISTRICT + 1, (int)std::floor((center.z + 190.0f) / avenue) + 1);
+
+    for (int ix = ix0; ix <= ix1; ++ix) {
+        for (int iz = iz0; iz <= iz1; ++iz) {
+            float x = ix * avenue, z = iz * avenue;
+            // 4 Cột đèn tại 4 hướng tiếp cận ngã tư, đặt trên vỉa hè ngay sát vạch dừng xe:
+            if (iz > CITY_MIN_DISTRICT)
+                drawModernTrafficLight(x + 9.2f, z - 13.5f, 0); // Nhánh Nam: đón xe đi +Z
+            if (iz <= CITY_MAX_DISTRICT)
+                drawModernTrafficLight(x - 9.2f, z + 13.5f, 1); // Nhánh Bắc: đón xe đi -Z
+            if (ix > CITY_MIN_DISTRICT)
+                drawModernTrafficLight(x - 13.5f, z + 9.2f, 2); // Nhánh Tây: đón xe đi +X
+            if (ix <= CITY_MAX_DISTRICT)
+                drawModernTrafficLight(x + 13.5f, z - 9.2f, 3); // Nhánh Đông: đón xe đi -X
         }
     }
 }
 
-// Kẻ vạch zebra qua tuyến chạy theo trục X: mỗi vạch kéo dài theo Z, vuông góc dòng xe.
-void drawCrosswalkX(float x, float z, float offset) {
-    const float stripeWidth = 0.56f;
-    for (int i = 0; i < 6; ++i) {
-        float cx = x + offset + i * 1.05f;
+// Mũi tên chỉ hướng làn xe màu trắng muốt trên mặt đường
+void drawRoadArrow(float x, float z, bool alongZ, float dir) {
+    glPushMatrix();
+    glTranslatef(x, -0.32f, z);
+    if (alongZ) {
+        if (dir < 0.0f) glRotatef(180.0f, 0.0f, 1.0f, 0.0f);
+    } else {
+        glRotatef(dir > 0.0f ? 90.0f : -90.0f, 0.0f, 1.0f, 0.0f);
+    }
+
+    // Thân mũi tên (Shaft)
+    glBegin(GL_QUADS);
+        glNormal3f(0.0f, 1.0f, 0.0f);
+        glVertex3f(-0.20f, 0.0f, -1.6f);
+        glVertex3f( 0.20f, 0.0f, -1.6f);
+        glVertex3f( 0.20f, 0.0f,  0.5f);
+        glVertex3f(-0.20f, 0.0f,  0.5f);
+    glEnd();
+
+    // Đầu mũi tên nhọn (Arrowhead)
+    glBegin(GL_TRIANGLES);
+        glNormal3f(0.0f, 1.0f, 0.0f);
+        glVertex3f( 0.0f,  0.0f,  1.9f);
+        glVertex3f(-0.75f, 0.0f,  0.4f);
+        glVertex3f( 0.75f, 0.0f,  0.4f);
+    glEnd();
+    glPopMatrix();
+}
+
+// Vạch sang đường người đi bộ (Zebra Crossing) qua tuyến đường chạy dọc trục Z
+// Các vạch sọc chạy song song với hướng xe chạy (theo trục Z) chuẩn mực quốc tế
+void drawCrosswalkZRoad(float x, float z, float side) {
+    float cz = z + side * 10.9f;
+    const float stripeW = 0.50f;
+    const float halfL = 1.9f;
+    for (int s = -6; s <= 6; ++s) {
+        float sx = x + s * 1.02f;
         glBegin(GL_QUADS);
             glNormal3f(0.0f, 1.0f, 0.0f);
-            glVertex3f(cx - stripeWidth * 0.5f, -0.29f, z + 7.4f);
-            glVertex3f(cx + stripeWidth * 0.5f, -0.29f, z + 7.4f);
-            glVertex3f(cx + stripeWidth * 0.5f, -0.29f, z - 7.4f);
-            glVertex3f(cx - stripeWidth * 0.5f, -0.29f, z - 7.4f);
+            glVertex3f(sx - stripeW * 0.5f, -0.32f, cz + halfL);
+            glVertex3f(sx + stripeW * 0.5f, -0.32f, cz + halfL);
+            glVertex3f(sx + stripeW * 0.5f, -0.32f, cz - halfL);
+            glVertex3f(sx - stripeW * 0.5f, -0.32f, cz - halfL);
         glEnd();
     }
 }
 
-// Kẻ vạch zebra qua tuyến chạy theo trục Z: mỗi vạch kéo dài theo X, vuông góc dòng xe.
-void drawCrosswalkZ(float x, float z, float offset) {
-    const float stripeWidth = 0.56f;
-    for (int i = 0; i < 6; ++i) {
-        float cz = z + offset + i * 1.05f;
+// Vạch sang đường người đi bộ (Zebra Crossing) qua tuyến đường chạy ngang trục X
+// Các vạch sọc chạy song song với hướng xe chạy (theo trục X) chuẩn mực quốc tế
+void drawCrosswalkXRoad(float x, float z, float side) {
+    float cx = x + side * 10.9f;
+    const float stripeW = 0.50f;
+    const float halfL = 1.9f;
+    for (int s = -6; s <= 6; ++s) {
+        float sz = z + s * 1.02f;
         glBegin(GL_QUADS);
             glNormal3f(0.0f, 1.0f, 0.0f);
-            glVertex3f(x - 7.4f, -0.29f, cz + stripeWidth * 0.5f);
-            glVertex3f(x + 7.4f, -0.29f, cz + stripeWidth * 0.5f);
-            glVertex3f(x + 7.4f, -0.29f, cz - stripeWidth * 0.5f);
-            glVertex3f(x - 7.4f, -0.29f, cz - stripeWidth * 0.5f);
+            glVertex3f(cx - halfL, -0.32f, sz + stripeW * 0.5f);
+            glVertex3f(cx + halfL, -0.32f, sz + stripeW * 0.5f);
+            glVertex3f(cx + halfL, -0.32f, sz - stripeW * 0.5f);
+            glVertex3f(cx - halfL, -0.32f, sz - stripeW * 0.5f);
         glEnd();
     }
 }
@@ -937,7 +1848,7 @@ void drawRoadAndBlocks(const Vec3& center) {
     const float minZ = -CITY_EDGE - ROAD_HALF_WIDTH, maxZ = CITY_EDGE + ROAD_HALF_WIDTH;
 
     // 1. Thảm cỏ xanh non rực rỡ bao bọc toàn bộ nền phố.
-    setMaterial(0.33f, 0.58f, 0.23f, 4.0f, 0.0f);
+    setMaterial(0.30f, 0.64f, 0.24f, 8.0f, 0.02f);
     glBegin(GL_QUADS);
         glNormal3f(0.0f, 1.0f, 0.0f);
         glVertex3f(minX, -0.40f, maxZ);
@@ -949,8 +1860,8 @@ void drawRoadAndBlocks(const Vec3& center) {
     int gx0 = CITY_MIN_ROAD_INDEX, gx1 = CITY_MAX_ROAD_INDEX;
     int gz0 = CITY_MIN_ROAD_INDEX, gz1 = CITY_MAX_ROAD_INDEX;
 
-    // Vỉa hè xám nhạt dừng trước giao lộ, không chạy xuyên qua lòng đường.
-    setMaterial(0.62f, 0.66f, 0.65f, 4.0f, 0.0f);
+    // Vỉa hè xám sáng sạch sẽ, có viền gờ dừng trước giao lộ.
+    setMaterial(0.72f, 0.76f, 0.78f, 15.0f, 0.08f);
     const float avenueSpacing = CITY_GRID_SPACING * 6.0f;
     for (int gx = gx0; gx <= gx1; gx++) {
         if (!isStreetIndex(gx)) continue;
@@ -1022,53 +1933,173 @@ void drawRoadAndBlocks(const Vec3& center) {
         }
     }
 
-    // 3. Vạch kẻ đường màu Trắng Muốt thanh lịch (Crisp White Road Markings như Hình 2)
-    setMaterial(0.95f, 0.96f, 0.98f, 20.0f);
+    // 3. VẠCH KẺ ĐƯỜNG ĐÔ THỊ CHUẨN XÁC, HỢP LÝ (REALISTIC URBAN ROAD MARKINGS)
+    setMaterial(0.96f, 0.97f, 0.98f, 20.0f, 0.0f);
+
+    // A. VẠCH TIM ĐƯỜNG & VẠCH BIÊN DỌC CÁC ĐẠI LỘ
+    // 1. Tuyến đường chạy dọc trục Z (Avenues along Z)
     for (int gx = gx0; gx <= gx1; gx++) {
-        if (isStreetIndex(gx)) {
-            float x = gx * CITY_GRID_SPACING;
-            for (int zStep = (int)std::ceil(minZ / 18.0f); zStep <= (int)std::floor(maxZ / 18.0f); zStep++) {
-                float z = zStep * 18.0f;
-                // Ngắt vạch làn trước các đại lộ để không đè lên vạch qua đường.
-                if (std::fabs(z - std::round(z / avenueSpacing) * avenueSpacing) < 17.5f) continue;
+        if (!isStreetIndex(gx)) continue;
+        float x = gx * CITY_GRID_SPACING;
+
+        for (int seg = CITY_MIN_DISTRICT; seg < CITY_MAX_DISTRICT + 1; ++seg) {
+            float z0 = seg * avenueSpacing;
+            float z1 = (seg + 1) * avenueSpacing;
+            float segMid = (z0 + z1) * 0.5f;
+
+            // a. Vạch liền tim đường trước 2 đầu ngã tư (No-Overtaking Solid Lines)
+            glBegin(GL_QUADS);
+                glNormal3f(0.0f, 1.0f, 0.0f);
+                glVertex3f(x - 0.12f, -0.32f, z0 + 29.0f);
+                glVertex3f(x + 0.12f, -0.32f, z0 + 29.0f);
+                glVertex3f(x + 0.12f, -0.32f, z0 + 14.2f);
+                glVertex3f(x - 0.12f, -0.32f, z0 + 14.2f);
+
+                glVertex3f(x - 0.12f, -0.32f, z1 - 14.2f);
+                glVertex3f(x + 0.12f, -0.32f, z1 - 14.2f);
+                glVertex3f(x + 0.12f, -0.32f, z1 - 29.0f);
+                glVertex3f(x - 0.12f, -0.32f, z1 - 29.0f);
+            glEnd();
+
+            // b. Vạch đứt quãng tim đường ở giữa đoạn phố (Dashed Center Lines)
+            for (int d = -4; d < 4; ++d) {
+                float dashCenter = segMid + (d + 0.5f) * 5.6f;
                 glBegin(GL_QUADS);
                     glNormal3f(0.0f, 1.0f, 0.0f);
-                    glVertex3f(x - 0.16f, -0.31f, z + 2.4f);
-                    glVertex3f(x + 0.16f, -0.31f, z + 2.4f);
-                    glVertex3f(x + 0.16f, -0.31f, z - 2.4f);
-                    glVertex3f(x - 0.16f, -0.31f, z - 2.4f);
+                    glVertex3f(x - 0.12f, -0.32f, dashCenter + 1.5f);
+                    glVertex3f(x + 0.12f, -0.32f, dashCenter + 1.5f);
+                    glVertex3f(x + 0.12f, -0.32f, dashCenter - 1.5f);
+                    glVertex3f(x - 0.12f, -0.32f, dashCenter - 1.5f);
                 glEnd();
             }
-        }
-    }
-    for (int gz = gz0; gz <= gz1; gz++) {
-        if (isStreetIndex(gz)) {
-            float z = gz * CITY_GRID_SPACING;
-            for (int xStep = (int)std::ceil(minX / 18.0f); xStep <= (int)std::floor(maxX / 18.0f); xStep++) {
-                float x = xStep * 18.0f;
-                if (std::fabs(x - std::round(x / avenueSpacing) * avenueSpacing) < 17.5f) continue;
+
+            // c. Vạch biên mép đường (Solid White Shoulder Lines) sát vỉa hè hai bên
+            for (int side = -1; side <= 1; side += 2) {
+                float edgeX = x + side * 7.15f;
                 glBegin(GL_QUADS);
                     glNormal3f(0.0f, 1.0f, 0.0f);
-                    glVertex3f(x - 2.4f, -0.30f, z + 0.16f);
-                    glVertex3f(x + 2.4f, -0.30f, z + 0.16f);
-                    glVertex3f(x + 2.4f, -0.30f, z - 0.16f);
-                    glVertex3f(x - 2.4f, -0.30f, z - 0.16f);
+                    glVertex3f(edgeX - 0.08f, -0.32f, z1 - 12.8f);
+                    glVertex3f(edgeX + 0.08f, -0.32f, z1 - 12.8f);
+                    glVertex3f(edgeX + 0.08f, -0.32f, z0 + 12.8f);
+                    glVertex3f(edgeX - 0.08f, -0.32f, z0 + 12.8f);
                 glEnd();
             }
         }
     }
 
-    // Mỗi ngã tư có bốn lối zebra: vạch luôn nằm ngang dòng xe, không bị đảo trục.
-    int crossX0 = CITY_MIN_DISTRICT + 1, crossX1 = CITY_MAX_DISTRICT;
-    int crossZ0 = CITY_MIN_DISTRICT + 1, crossZ1 = CITY_MAX_DISTRICT;
-    for (int ix = crossX0; ix <= crossX1; ++ix) {
-        for (int iz = crossZ0; iz <= crossZ1; ++iz) {
-            float x = ix * avenueSpacing, z = iz * avenueSpacing;
+    // 2. Tuyến đường chạy ngang trục X (Avenues along X)
+    for (int gz = gz0; gz <= gz1; gz++) {
+        if (!isStreetIndex(gz)) continue;
+        float z = gz * CITY_GRID_SPACING;
+
+        for (int seg = CITY_MIN_DISTRICT; seg < CITY_MAX_DISTRICT + 1; ++seg) {
+            float x0 = seg * avenueSpacing;
+            float x1 = (seg + 1) * avenueSpacing;
+            float segMid = (x0 + x1) * 0.5f;
+
+            // a. Vạch liền tim đường trước 2 đầu ngã tư (No-Overtaking Solid Lines)
+            glBegin(GL_QUADS);
+                glNormal3f(0.0f, 1.0f, 0.0f);
+                glVertex3f(x0 + 29.0f, -0.32f, z - 0.12f);
+                glVertex3f(x0 + 29.0f, -0.32f, z + 0.12f);
+                glVertex3f(x0 + 14.2f, -0.32f, z + 0.12f);
+                glVertex3f(x0 + 14.2f, -0.32f, z - 0.12f);
+
+                glVertex3f(x1 - 14.2f, -0.32f, z - 0.12f);
+                glVertex3f(x1 - 14.2f, -0.32f, z + 0.12f);
+                glVertex3f(x1 - 29.0f, -0.32f, z + 0.12f);
+                glVertex3f(x1 - 29.0f, -0.32f, z - 0.12f);
+            glEnd();
+
+            // b. Vạch đứt quãng tim đường ở giữa đoạn phố
+            for (int d = -4; d < 4; ++d) {
+                float dashCenter = segMid + (d + 0.5f) * 5.6f;
+                glBegin(GL_QUADS);
+                    glNormal3f(0.0f, 1.0f, 0.0f);
+                    glVertex3f(dashCenter + 1.5f, -0.32f, z - 0.12f);
+                    glVertex3f(dashCenter + 1.5f, -0.32f, z + 0.12f);
+                    glVertex3f(dashCenter - 1.5f, -0.32f, z + 0.12f);
+                    glVertex3f(dashCenter - 1.5f, -0.32f, z - 0.12f);
+                glEnd();
+            }
+
+            // c. Vạch biên mép đường (Solid White Shoulder Lines) sát vỉa hè hai bên
             for (int side = -1; side <= 1; side += 2) {
-                // Đường ngang (trục X): vị trí vạch lệch theo X, bề dài chạy theo Z.
-                drawCrosswalkX(x, z, side * 9.2f);
-                // Đường dọc (trục Z): vị trí vạch lệch theo Z, bề dài chạy theo X.
-                drawCrosswalkZ(x, z, side * 9.2f);
+                float edgeZ = z + side * 7.15f;
+                glBegin(GL_QUADS);
+                    glNormal3f(0.0f, 1.0f, 0.0f);
+                    glVertex3f(x1 - 12.8f, -0.32f, edgeZ - 0.08f);
+                    glVertex3f(x1 - 12.8f, -0.32f, edgeZ + 0.08f);
+                    glVertex3f(x0 + 12.8f, -0.32f, edgeZ + 0.08f);
+                    glVertex3f(x0 + 12.8f, -0.32f, edgeZ - 0.08f);
+                glEnd();
+            }
+        }
+    }
+
+    // B. CÁC GIAO LỘ NGÃ TƯ: VẠCH QUA ĐƯỜNG, VẠCH DỪNG XE, MŨI TÊN CHỈ HƯỚNG
+    for (int ix = -2; ix <= 2; ++ix) {
+        for (int iz = -2; iz <= 2; ++iz) {
+            float x = ix * avenueSpacing, z = iz * avenueSpacing;
+
+            // Nhánh Bắc/Nam (Đường chạy dọc trục Z qua ngã tư)
+            // Nhánh -Z (side = -1): xe đi hướng +Z về ngã tư
+            if (iz > -2) {
+                drawCrosswalkZRoad(x, z, -1.0f);
+                // Vạch dừng xe (Stop Line) ở làn xe chạy tới (bên phải tim đường: x > 0)
+                glBegin(GL_QUADS);
+                    glNormal3f(0.0f, 1.0f, 0.0f);
+                    glVertex3f(x + 0.18f, -0.32f, z - 13.95f);
+                    glVertex3f(x + 7.15f, -0.32f, z - 13.95f);
+                    glVertex3f(x + 7.15f, -0.32f, z - 14.45f);
+                    glVertex3f(x + 0.18f, -0.32f, z - 14.45f);
+                glEnd();
+                // Mũi tên chỉ hướng trên mặt đường làn vào
+                drawRoadArrow(x + 3.6f, z - 21.0f, true, 1.0f);
+            }
+            // Nhánh +Z (side = +1): xe đi hướng -Z về ngã tư
+            if (iz < 2) {
+                drawCrosswalkZRoad(x, z, 1.0f);
+                // Vạch dừng xe ở làn xe chạy tới (bên phải tim đường: x < 0)
+                glBegin(GL_QUADS);
+                    glNormal3f(0.0f, 1.0f, 0.0f);
+                    glVertex3f(x - 7.15f, -0.32f, z + 14.45f);
+                    glVertex3f(x - 0.18f, -0.32f, z + 14.45f);
+                    glVertex3f(x - 0.18f, -0.32f, z + 13.95f);
+                    glVertex3f(x - 7.15f, -0.32f, z + 13.95f);
+                glEnd();
+                // Mũi tên chỉ hướng trên mặt đường làn vào
+                drawRoadArrow(x - 3.6f, z + 21.0f, true, -1.0f);
+            }
+
+            // Nhánh Tây/Đông (Đường chạy ngang trục X qua ngã tư)
+            // Nhánh -X (side = -1): xe đi hướng +X về ngã tư
+            if (ix > -2) {
+                drawCrosswalkXRoad(x, z, -1.0f);
+                // Vạch dừng xe ở làn xe chạy tới (bên phải tim đường: z > 0)
+                glBegin(GL_QUADS);
+                    glNormal3f(0.0f, 1.0f, 0.0f);
+                    glVertex3f(x - 13.95f, -0.32f, z + 0.18f);
+                    glVertex3f(x - 13.95f, -0.32f, z + 7.15f);
+                    glVertex3f(x - 14.45f, -0.32f, z + 7.15f);
+                    glVertex3f(x - 14.45f, -0.32f, z + 0.18f);
+                glEnd();
+                // Mũi tên chỉ hướng trên mặt đường làn vào
+                drawRoadArrow(x - 21.0f, z + 3.6f, false, 1.0f);
+            }
+            // Nhánh +X (side = +1): xe đi hướng -X về ngã tư
+            if (ix < 2) {
+                drawCrosswalkXRoad(x, z, 1.0f);
+                // Vạch dừng xe ở làn xe chạy tới (bên phải tim đường: z < 0)
+                glBegin(GL_QUADS);
+                    glNormal3f(0.0f, 1.0f, 0.0f);
+                    glVertex3f(x + 14.45f, -0.32f, z - 7.15f);
+                    glVertex3f(x + 14.45f, -0.32f, z - 0.18f);
+                    glVertex3f(x + 13.95f, -0.32f, z - 0.18f);
+                    glVertex3f(x + 13.95f, -0.32f, z - 7.15f);
+                glEnd();
+                // Mũi tên chỉ hướng trên mặt đường làn vào
+                drawRoadArrow(x + 21.0f, z - 3.6f, false, -1.0f);
             }
         }
     }
@@ -1100,13 +2131,93 @@ void initCityCars() {
 
 void updateCityCars(float dt) {
     float limit = CITY_EDGE - 15.0f;
+    bool zGreen = isTrafficGreenForZ(animTime);
+    bool xGreen = isTrafficGreenForX(animTime);
+
     for (auto& c : cityCars) {
+        bool shouldStop = false;
+
         if (c.runsAlongX) {
-            c.x += c.dir * c.speed * dt;
+            // Xe chạy theo trục X
+            float nextIntersectionX = 0.0f;
+            if (c.dir > 0.0f) {
+                // Hướng +X: tìm ngã tư gần nhất phía trước
+                nextIntersectionX = std::ceil((c.x + 0.1f) / 105.0f) * 105.0f;
+                float stopLineX = nextIntersectionX - 14.2f;
+                float distToStop = stopLineX - c.x;
+                // Nếu đèn đỏ/vàng cho trục X và xe đang áp sát vạch dừng (khoảng cách 0.5m -> 20m)
+                if (!xGreen && distToStop > 0.3f && distToStop < 20.0f) {
+                    shouldStop = true;
+                }
+            } else {
+                // Hướng -X
+                nextIntersectionX = std::floor((c.x - 0.1f) / 105.0f) * 105.0f;
+                float stopLineX = nextIntersectionX + 14.2f;
+                float distToStop = c.x - stopLineX;
+                if (!xGreen && distToStop > 0.3f && distToStop < 20.0f) {
+                    shouldStop = true;
+                }
+            }
+        } else {
+            // Xe chạy theo trục Z
+            float nextIntersectionZ = 0.0f;
+            if (c.dir > 0.0f) {
+                // Hướng +Z: tìm ngã tư gần nhất phía trước
+                nextIntersectionZ = std::ceil((c.z + 0.1f) / 105.0f) * 105.0f;
+                float stopLineZ = nextIntersectionZ - 14.2f;
+                float distToStop = stopLineZ - c.z;
+                if (!zGreen && distToStop > 0.3f && distToStop < 20.0f) {
+                    shouldStop = true;
+                }
+            } else {
+                // Hướng -Z
+                nextIntersectionZ = std::floor((c.z - 0.1f) / 105.0f) * 105.0f;
+                float stopLineZ = nextIntersectionZ + 14.2f;
+                float distToStop = c.z - stopLineZ;
+                if (!zGreen && distToStop > 0.3f && distToStop < 20.0f) {
+                    shouldStop = true;
+                }
+            }
+        }
+
+        // Giữ khoảng cách an toàn với xe cùng làn phía trước (không tông đuôi xe khác)
+        for (const auto& other : cityCars) {
+            if (&other == &c) continue;
+            if (other.runsAlongX != c.runsAlongX) continue;
+            if (other.dir != c.dir) continue;
+
+            if (c.runsAlongX) {
+                if (std::fabs(c.z - other.z) < 1.2f) {
+                    float gap = (other.x - c.x) * c.dir;
+                    if (gap > 0.2f && gap < 8.5f) {
+                        shouldStop = true;
+                    }
+                }
+            } else {
+                if (std::fabs(c.x - other.x) < 1.2f) {
+                    float gap = (other.z - c.z) * c.dir;
+                    if (gap > 0.2f && gap < 8.5f) {
+                        shouldStop = true;
+                    }
+                }
+            }
+        }
+
+        // Tăng / giảm tốc êm ái
+        float targetSpeed = shouldStop ? 0.0f : c.speed;
+        if (c.currentSpeed > targetSpeed) {
+            c.currentSpeed = std::max(targetSpeed, c.currentSpeed - 24.0f * dt); // Phanh hãm
+        } else if (c.currentSpeed < targetSpeed) {
+            c.currentSpeed = std::min(targetSpeed, c.currentSpeed + 16.0f * dt); // Đạp ga tăng tốc
+        }
+
+        // Cập nhật vị trí
+        if (c.runsAlongX) {
+            c.x += c.dir * c.currentSpeed * dt;
             if (c.x > limit)  c.x = -limit;
             if (c.x < -limit) c.x = limit;
         } else {
-            c.z += c.dir * c.speed * dt;
+            c.z += c.dir * c.currentSpeed * dt;
             if (c.z > limit)  c.z = -limit;
             if (c.z < -limit) c.z = limit;
         }
@@ -1121,6 +2232,21 @@ void drawCityCar(const CityCar& c) {
     } else {
         glRotatef(c.dir > 0 ? 0.0f : 180.0f, 0.0f, 1.0f, 0.0f);
     }
+
+    // 0. Bóng đổ mềm gầm xe (Car drop shadow)
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_LIGHTING);
+    glDepthMask(GL_FALSE);
+    glColor4f(0.04f, 0.05f, 0.07f, 0.40f);
+    glBegin(GL_QUADS);
+        glVertex3f(-1.15f, 0.035f, -2.15f);
+        glVertex3f( 1.15f, 0.035f, -2.15f);
+        glVertex3f( 1.15f, 0.035f,  2.15f);
+        glVertex3f(-1.15f, 0.035f,  2.15f);
+    glEnd();
+    glPopAttrib();
 
     // Thân xe
     setMaterial(c.color.r, c.color.g, c.color.b, 5.0f, 0.0f);
@@ -1150,8 +2276,12 @@ void drawCityCar(const CityCar& c) {
     glutSolidCube(1.0);
     glPopMatrix();
 
-    // Đèn pha trước
+    // Đèn pha trước phát sáng ban đêm
     setMaterial(1.0f, 0.95f, 0.75f, 80.0f);
+    if (nightFactor > 0.05f) {
+        GLfloat glow[] = { nightFactor * 1.0f, nightFactor * 0.95f, nightFactor * 0.75f, 1.0f };
+        glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, glow);
+    }
     glPushMatrix();
     glTranslatef(0.6f, 0.60f, 1.92f);
     glScalef(0.35f, 0.20f, 0.10f);
@@ -1163,8 +2293,19 @@ void drawCityCar(const CityCar& c) {
     glutSolidCube(1.0);
     glPopMatrix();
 
-    // Đèn hậu đỏ
-    setMaterial(0.85f, 0.15f, 0.15f, 80.0f);
+    // Đèn hậu & đèn phanh đỏ: sáng rực khi xe giảm tốc/dừng chờ đèn đỏ
+    bool isBraking = c.currentSpeed < c.speed * 0.75f;
+    if (isBraking) {
+        setMaterial(1.0f, 0.05f, 0.05f, 100.0f, 1.0f);
+        GLfloat brakeGlow[] = { 1.0f, 0.08f, 0.08f, 1.0f };
+        glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, brakeGlow);
+    } else {
+        setMaterial(0.95f, 0.15f, 0.15f, 80.0f);
+        if (nightFactor > 0.05f) {
+            GLfloat glow[] = { nightFactor * 1.0f, nightFactor * 0.1f, nightFactor * 0.1f, 1.0f };
+            glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, glow);
+        }
+    }
     glPushMatrix();
     glTranslatef(0.6f, 0.60f, -1.92f);
     glScalef(0.35f, 0.20f, 0.10f);
@@ -1221,11 +2362,77 @@ void drawPark(float x, float z) {
     setMaterial(0.72f, 0.76f, 0.70f, 4.0f, 0.0f);
     glPushMatrix(); glTranslatef(x, -0.13f, z); drawCube(3.2f, 0.12f, 72.0f); glPopMatrix();
     glPushMatrix(); glTranslatef(x, -0.12f, z); drawCube(76.0f, 0.12f, 3.2f); glPopMatrix();
-    setMaterial(0.18f, 0.48f, 0.22f, 4.0f, 0.0f);
-    drawGroundRect(x, z, 13.0f, 13.0f, -0.08f);
-    glPushMatrix(); glTranslatef(x, -0.08f, z); drawCylinder(4.4f, 0.6f, 20); glPopMatrix();
-    setMaterial(0.25f, 0.72f, 0.86f, 45.0f, 0.35f);
-    glPushMatrix(); glTranslatef(x, 0.65f, z); glScalef(3.0f, 0.65f, 3.0f); glutSolidSphere(1.0, 16, 10); glPopMatrix();
+    // --- ĐÀI PHUN NƯỚC NGHỆ THUẬT CÓ HOẠT ẢNH (ANIMATED CASCADING FOUNTAIN) ---
+    // 1. Hồ chứa nước tầng 1 (Base stone basin)
+    setMaterial(0.82f, 0.84f, 0.88f, 20.0f);
+    glPushMatrix();
+    glTranslatef(x, -0.08f, z);
+    drawCylinder(5.4f, 0.65f, 24);
+    glPopMatrix();
+
+    // Mặt nước tầng 1
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    setMaterial(0.20f, 0.65f, 0.82f, 60.0f, 0.5f);
+    glPushMatrix();
+    glTranslatef(x, 0.42f, z);
+    drawCylinder(4.9f, 0.08f, 24);
+    glPopMatrix();
+
+    // 2. Trụ và tháp đĩa tầng 2 (Upper tier pedestal & bowl)
+    setMaterial(0.85f, 0.87f, 0.90f, 25.0f);
+    glPushMatrix();
+    glTranslatef(x, 0.42f, z);
+    drawCylinder(1.3f, 1.25f, 16);
+    glPopMatrix();
+
+    glPushMatrix();
+    glTranslatef(x, 1.60f, z);
+    drawCylinder(2.6f, 0.38f, 20);
+    glPopMatrix();
+
+    // 3. Cột nước phun trung tâm (Central pulsing water jet)
+    float jetH = 2.4f + 0.7f * std::sin(animTime * 5.0f);
+    float jetWarp = 0.08f * std::cos(animTime * 8.0f);
+
+    // Đèn LED chiếu sáng đài phun nước ban đêm (Color-cycling LED)
+    float ledR = 0.3f + 0.5f * std::sin(animTime * 1.5f);
+    float ledG = 0.5f + 0.4f * std::sin(animTime * 1.5f + 2.0f);
+    float ledB = 0.7f + 0.3f * std::sin(animTime * 1.5f + 4.0f);
+    if (timeOfDay < 6.0f || timeOfDay > 18.0f) {
+        glColor4f(ledR, ledG, ledB, 0.85f);
+    } else {
+        glColor4f(0.85f, 0.95f, 1.0f, 0.75f);
+    }
+    glDisable(GL_LIGHTING);
+
+    // Cột nước chính vươn cao
+    glPushMatrix();
+    glTranslatef(x + jetWarp, 1.95f, z);
+    glScalef(0.42f, jetH, 0.42f);
+    glutSolidSphere(1.0, 12, 10);
+    glPopMatrix();
+
+    // Đầu tia nước văng
+    glPushMatrix();
+    glTranslatef(x, 1.95f + jetH * 0.95f, z);
+    glScalef(0.65f, 0.35f, 0.65f);
+    glutSolidSphere(1.0, 10, 8);
+    glPopMatrix();
+
+    // 4. 6 tia nước uốn cong rơi từ tầng trên xuống tầng dưới
+    for (int k = 0; k < 6; ++k) {
+        float ang = k * (2.0f * 3.14159265f / 6.0f) + animTime * 0.4f;
+        float sprayR = 2.2f + 1.6f * std::fmod(animTime * 1.2f + (float)k * 0.2f, 1.0f);
+        float sprayY = 1.85f - 1.4f * std::pow(sprayR / 3.8f, 2.0f);
+        glPushMatrix();
+        glTranslatef(x + std::cos(ang) * sprayR, sprayY, z + std::sin(ang) * sprayR);
+        glScalef(0.20f, 0.20f, 0.20f);
+        glutSolidSphere(1.0, 6, 6);
+        glPopMatrix();
+    }
+    glPopAttrib();
 
     const float treePos[8][2] = {
         {-29,-25},{-10,-28},{11,-28},{30,-24}, {-29,25},{-10,29},{12,28},{30,24}
@@ -1354,6 +2561,103 @@ bool sphereStadiumRingHit(const Vec3& p, float radius, const Building& b) {
     return insideOuter && outsideField;
 }
 
+void drawCommercialPodium(int dx, int dz) {
+    float districtSize = CITY_GRID_SPACING * 6.0f;
+    float x0 = dx * districtSize;
+    float z0 = dz * districtSize;
+
+    // Khối đế thương mại liên hoàn nằm ở khu vực phía Đông - Trung tâm của ô phố (kết nối các tháp cao ốc)
+    float px = x0 + 68.0f;
+    float pz = z0 + 58.0f;
+    float pw = 48.0f;
+    float pd = 42.0f;
+    float ph = 7.2f;
+
+    glPushMatrix();
+    glTranslatef(px, ph * 0.5f - 0.28f, pz);
+
+    // 1. Thân khối đế thương mại màu đá trắng sứ hiện đại
+    setMaterial(0.88f, 0.90f, 0.92f, 15.0f, 0.1f);
+    drawCube(pw, ph, pd);
+
+    // 2. Dải kính mặt tiền tầng trệt và tầng 2 (Retail Curtain Glass)
+    setMaterial(0.18f, 0.55f, 0.72f, 40.0f, 0.35f);
+    // Kính mặt Nam nhìn ra quảng trường
+    glPushMatrix();
+    glTranslatef(0.0f, -0.6f, -pd * 0.5f - 0.05f);
+    drawCube(pw * 0.88f, ph * 0.68f, 0.12f);
+    glPopMatrix();
+    // Kính mặt Đông nhìn ra đại lộ
+    glPushMatrix();
+    glTranslatef(pw * 0.5f + 0.05f, -0.6f, 0.0f);
+    drawCube(0.12f, ph * 0.68f, pd * 0.82f);
+    glPopMatrix();
+
+    // 3. Sàn sân thượng (Rooftop Deck Terrace) màu xám sẫm
+    setMaterial(0.32f, 0.36f, 0.40f, 10.0f, 0.05f);
+    glPushMatrix();
+    glTranslatef(0.0f, ph * 0.5f + 0.15f, 0.0f);
+    drawCube(pw * 0.98f, 0.30f, pd * 0.98f);
+    glPopMatrix();
+
+    // 4. Lan can an toàn bao quanh sân thượng (Safety Balustrade)
+    setMaterial(0.92f, 0.94f, 0.96f, 30.0f, 0.3f);
+    float railH = 0.85f;
+    float topY = ph * 0.5f + 0.30f + railH * 0.5f;
+    // Lan can cạnh Nam
+    glPushMatrix();
+    glTranslatef(0.0f, topY, -pd * 0.48f);
+    drawCube(pw * 0.94f, railH, 0.15f);
+    glPopMatrix();
+    // Lan can cạnh Đông
+    glPushMatrix();
+    glTranslatef(pw * 0.48f, topY, 0.0f);
+    drawCube(0.15f, railH, pd * 0.94f);
+    glPopMatrix();
+
+    glPopMatrix();
+
+    // 5. Cây xanh cảnh quan và ghế nghỉ trên sân thượng khối đế
+    drawStylizedTree(px + 12.0f, pz - 10.0f, 0);
+    drawStylizedTree(px - 14.0f, pz + 8.0f, 1);
+}
+
+void drawDistrictPlaza(int dx, int dz) {
+    float districtSize = CITY_GRID_SPACING * 6.0f;
+    float x0 = dx * districtSize;
+    float z0 = dz * districtSize;
+
+    // Sân quảng trường đi bộ lát đá phía trước các shophouse (South Frontage Plaza)
+    float plazaX = x0 + 52.5f;
+    float plazaZ = z0 + 17.5f;
+    float plazaW = 86.0f;
+    float plazaD = 18.0f;
+
+    setMaterial(0.72f, 0.74f, 0.76f, 8.0f, 0.02f);
+    glPushMatrix();
+    glTranslatef(plazaX, -0.28f, plazaZ);
+    glBegin(GL_QUADS);
+        glNormal3f(0.0f, 1.0f, 0.0f);
+        glVertex3f(-plazaW * 0.5f, 0.0f,  plazaD * 0.5f);
+        glVertex3f( plazaW * 0.5f, 0.0f,  plazaD * 0.5f);
+        glVertex3f( plazaW * 0.5f, 0.0f, -plazaD * 0.5f);
+        glVertex3f(-plazaW * 0.5f, 0.0f, -plazaD * 0.5f);
+    glEnd();
+    glPopMatrix();
+
+    // Hàng cây xanh bóng mát và ghế ngồi trong quảng trường
+    float treeOffsets[3] = { -28.0f, 0.0f, 28.0f };
+    for (int t = 0; t < 3; ++t) {
+        drawStylizedTree(plazaX + treeOffsets[t], z0 + 10.5f, t % 3);
+        // Ghế gỗ công viên cạnh bồn cây
+        setMaterial(0.42f, 0.25f, 0.13f, 5.0f, 0.0f);
+        glPushMatrix();
+        glTranslatef(plazaX + treeOffsets[t] + 4.2f, 0.22f, z0 + 10.5f);
+        drawCube(3.2f, 0.24f, 0.75f);
+        glPopMatrix();
+    }
+}
+
 void drawDistrictAmenities(const Vec3& center) {
     const float districtSize = CITY_GRID_SPACING * 6.0f;
     int dx0 = std::max(CITY_MIN_DISTRICT, (int)std::floor((center.x - 250.0f) / districtSize));
@@ -1362,61 +2666,240 @@ void drawDistrictAmenities(const Vec3& center) {
     int dz1 = std::min(CITY_MAX_DISTRICT, (int)std::floor((center.z + 250.0f) / districtSize));
     for (int dx = dx0; dx <= dx1; ++dx) for (int dz = dz0; dz <= dz1; ++dz) {
         int type = districtAmenity(dx, dz);
-        if (type == AMENITY_CITY || type == AMENITY_RESIDENTIAL) continue;
         float x = (dx + 0.5f) * districtSize, z = (dz + 0.5f) * districtSize;
         float ox = x - center.x, oz = z - center.z;
         if (ox * ox + oz * oz > 285.0f * 285.0f) continue;
-        if (type == AMENITY_PARK) drawPark(x, z);
-        else if (type == AMENITY_MALL) drawShoppingMall(x, z);
-        else if (type == AMENITY_STADIUM) drawStadium(x, z);
-        else if (type == AMENITY_SCHOOL) drawSchool(x, z);
-        else if (type == AMENITY_HOSPITAL) drawHospital(x, z);
+
+        if (type == AMENITY_CITY) {
+            drawCommercialPodium(dx, dz);
+            drawDistrictPlaza(dx, dz);
+        } else if (type == AMENITY_PARK) {
+            drawPark(x, z);
+        } else if (type == AMENITY_MALL) {
+            drawShoppingMall(x, z);
+        } else if (type == AMENITY_STADIUM) {
+            drawStadium(x, z);
+        } else if (type == AMENITY_SCHOOL) {
+            drawSchool(x, z);
+        } else if (type == AMENITY_HOSPITAL) {
+            drawHospital(x, z);
+        }
     }
+}
+
+/**
+ * Vẽ Cột Tuabin gió phong điện (Wind Turbine) trên sườn núi
+ */
+void drawSingleWindTurbine(float x, float y, float z, float bladeAngle) {
+    glPushMatrix();
+    glTranslatef(x, y, z);
+
+    // 1. Chân đế bê tông vững chắc
+    setMaterial(0.65f, 0.68f, 0.72f, 15.0f);
+    drawCylinder(2.2f, 1.5f, 16);
+
+    // 2. Tháp tuabin hình trụ côn trắng muốt vút cao 38m
+    setMaterial(0.95f, 0.96f, 0.98f, 30.0f, 0.4f);
+    glPushMatrix();
+    glTranslatef(0.0f, 1.5f, 0.0f);
+    drawCylinder(1.2f, 36.0f, 16);
+    glPopMatrix();
+
+    // 3. Cabin phát điện (Nacelle) trên đỉnh tháp
+    glPushMatrix();
+    glTranslatef(0.0f, 37.5f, 0.0f);
+    glRotatef(90.0f, 0.0f, 1.0f, 0.0f); // Mũi tuabin quay về phía thành phố (hướng Đông)
+
+    setMaterial(0.92f, 0.93f, 0.95f, 40.0f, 0.3f);
+    glPushMatrix();
+    glTranslatef(0.0f, 0.0f, -0.6f);
+    glScalef(1.4f, 1.5f, 4.2f);
+    glutSolidCube(1.0);
+    glPopMatrix();
+
+    // Đèn LED đỏ cảnh báo hàng không chớp nháy trên nóc nacelle
+    bool beacon = std::fmod(animTime, 1.2f) < 0.6f;
+    if (beacon) {
+        setMaterial(1.0f, 0.1f, 0.1f, 80.0f, 1.0f);
+        GLfloat glow[] = { 1.0f, 0.1f, 0.1f, 1.0f };
+        glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, glow);
+    } else {
+        setMaterial(0.3f, 0.05f, 0.05f, 10.0f, 0.0f);
+    }
+    glPushMatrix();
+    glTranslatef(0.0f, 1.0f, -0.6f);
+    glScalef(0.22f, 0.22f, 0.22f);
+    glutSolidSphere(1.0, 8, 6);
+    glPopMatrix();
+
+    // 4. Trục xoay mũi nhọn (Spinner)
+    setMaterial(0.96f, 0.97f, 0.99f, 50.0f, 0.5f);
+    glPushMatrix();
+    glTranslatef(0.0f, 0.0f, 1.6f);
+    drawCone(1.1f, 1.8f, 16);
+
+    // 5. Ba cánh quạt khí động học khổng lồ (Rotor Blades)
+    glRotatef(bladeAngle, 0.0f, 0.0f, 1.0f);
+    for (int b = 0; b < 3; ++b) {
+        glPushMatrix();
+        glRotatef(b * 120.0f, 0.0f, 0.0f, 1.0f);
+        glTranslatef(0.0f, 7.5f, 0.1f);
+        glScalef(0.65f, 15.0f, 0.14f);
+        glutSolidCube(1.0);
+        glPopMatrix();
+    }
+    glPopMatrix();
+
+    glPopMatrix();
+    glPopMatrix();
+}
+
+void drawWindTurbines() {
+    float bladeRot = animTime * 85.0f;
+    drawSingleWindTurbine(-248.0f, 12.0f, -180.0f, bladeRot);
+    drawSingleWindTurbine(-252.0f, 18.0f,  -60.0f, bladeRot + 45.0f);
+    drawSingleWindTurbine(-250.0f, 16.0f,   60.0f, bladeRot + 90.0f);
+    drawSingleWindTurbine(-248.0f, 14.0f,  180.0f, bladeRot + 135.0f);
+}
+
+/**
+ * Vẽ Khinh khí cầu ngắm cảnh bồng bềnh trên bầu trời (Scenic Hot Air Balloon)
+ */
+void drawHotAirBalloon() {
+    float bx = 120.0f + std::cos(animTime * 0.06f) * 45.0f;
+    float bz = -60.0f + std::sin(animTime * 0.06f) * 55.0f;
+    float by = 86.0f + std::sin(animTime * 0.35f) * 2.2f;
+
+    glPushMatrix();
+    glTranslatef(bx, by, bz);
+    glRotatef(std::sin(animTime * 0.2f) * 4.0f, 0.0f, 0.0f, 1.0f);
+
+    const float goreColors[4][3] = {
+        { 0.92f, 0.25f, 0.22f }, // Đỏ san hô
+        { 0.98f, 0.82f, 0.20f }, // Vàng rực
+        { 0.95f, 0.96f, 0.98f }, // Trắng ngà
+        { 0.22f, 0.65f, 0.85f }  // Lam ngọc
+    };
+
+    // Vòm tròn phía trên
+    glPushMatrix();
+    glTranslatef(0.0f, 3.5f, 0.0f);
+    glScalef(6.8f, 8.2f, 6.8f);
+    setMaterial(0.92f, 0.25f, 0.22f, 20.0f, 0.2f);
+    glutSolidSphere(1.0, 20, 16);
+    glPopMatrix();
+
+    // Dải sọc màu trang trí quanh thân khí cầu
+    for (int s = 0; s < 4; ++s) {
+        setMaterial(goreColors[s][0], goreColors[s][1], goreColors[s][2], 25.0f);
+        glPushMatrix();
+        glTranslatef(0.0f, 2.8f - s * 0.8f, 0.0f);
+        drawCylinder(6.85f - s * 0.35f, 0.65f, 24);
+        glPopMatrix();
+    }
+
+    // Đáy côn thu
+    setMaterial(0.88f, 0.35f, 0.20f, 20.0f);
+    glPushMatrix();
+    glTranslatef(0.0f, 0.8f, 0.0f);
+    glRotatef(180.0f, 1.0f, 0.0f, 0.0f);
+    drawCone(5.8f, 5.0f, 20);
+    glPopMatrix();
+
+    // Ngọn lửa đốt khí nóng
+    setMaterial(1.0f, 0.65f, 0.1f, 80.0f, 1.0f);
+    GLfloat flameGlow[] = { 1.0f, 0.65f, 0.1f, 1.0f };
+    glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, flameGlow);
+    glPushMatrix();
+    glTranslatef(0.0f, -4.5f, 0.0f);
+    glScalef(0.45f, 0.9f + 0.3f * std::sin(animTime * 14.0f), 0.45f);
+    glutSolidSphere(1.0, 10, 8);
+    glPopMatrix();
+
+    // Giỏ mây (Gondola)
+    setMaterial(0.48f, 0.32f, 0.18f, 8.0f, 0.0f);
+    glPushMatrix();
+    glTranslatef(0.0f, -7.2f, 0.0f);
+    drawCube(2.4f, 1.6f, 2.4f);
+    glPopMatrix();
+
+    // Bốn dây cáp treo
+    setMaterial(0.25f, 0.25f, 0.28f, 10.0f);
+    for (int cx = -1; cx <= 1; cx += 2) {
+        for (int cz = -1; cz <= 1; cz += 2) {
+            glPushMatrix();
+            glTranslatef(cx * 0.95f, -5.8f, cz * 0.95f);
+            drawCylinder(0.035f, 2.6f, 6);
+            glPopMatrix();
+        }
+    }
+
+    glPopMatrix();
 }
 
 void drawBoundaryScenery() {
     // Biển và bãi cát cố định ở phía Đông; mặt nước cũng khép hai đầu khu demo.
-    setMaterial(0.04f, 0.42f, 0.68f, 34.0f, 0.30f);
+    setMaterial(0.06f, 0.40f, 0.68f, 50.0f, 0.55f);
     drawGroundRect(465.0f, 0.0f, 470.0f, 1400.0f, -0.39f);
     drawGroundRect(10.0f, 465.0f, 440.0f, 470.0f, -0.39f);
     drawGroundRect(10.0f, -465.0f, 440.0f, 470.0f, -0.39f);
 
-    // Gợn sóng sáng giúp mặt biển xanh hiện rõ ở mép thành phố.
-    setMaterial(0.28f, 0.70f, 0.84f, 28.0f, 0.22f);
-    for (int i = -12; i <= 12; ++i) {
-        float z = i * 52.0f + 11.0f * std::sin(i * 0.8f);
-        drawGroundRect(465.0f, z, 420.0f, 0.26f, -0.375f);
-    }
-    for (int i = 1; i <= 7; ++i) {
-        drawGroundRect(0.0f, 230.0f + i * 52.0f, 0.26f, 420.0f, -0.375f);
-        drawGroundRect(0.0f, -230.0f - i * 52.0f, 0.26f, 420.0f, -0.375f);
-    }
+    // Mặt nước biển tĩnh thanh lịch phong cách vector
 
-    setMaterial(0.78f, 0.68f, 0.43f, 5.0f, 0.0f);
-    drawGroundRect(224.0f, 0.0f, 12.0f, 420.0f, -0.365f);
-    drawGroundRect(10.0f, 224.0f, 440.0f, 12.0f, -0.365f);
-    drawGroundRect(10.0f, -224.0f, 440.0f, 12.0f, -0.365f);
+    // Bãi cát vàng mịn màng ven bờ biển
+    setMaterial(0.88f, 0.80f, 0.58f, 10.0f, 0.05f);
+    drawGroundRect(228.0f, 0.0f, 20.0f, 440.0f, -0.365f);
+    drawGroundRect(10.0f, 228.0f, 440.0f, 20.0f, -0.365f);
+    drawGroundRect(10.0f, -228.0f, 440.0f, 20.0f, -0.365f);
 
-    // Dải đá tĩnh dưới chân núi ở phía Tây.
-    setMaterial(0.30f, 0.37f, 0.35f, 6.0f, 0.0f);
-    drawGroundRect(-266.0f, 0.0f, 92.0f, 760.0f, -0.385f);
+    // Dải chân đồi đá thoai thoải phía Tây (Foothills buffer lùi xa ngoài rìa đường xá)
+    setMaterial(0.26f, 0.32f, 0.28f, 5.0f, 0.0f);
+    drawGroundRect(-330.0f, 0.0f, 210.0f, 880.0f, -0.385f);
 
-    // Dãy núi đa giác: các đỉnh và màu cố định, không tạo thêm khi drone di chuyển.
-    for (int i = 0; i < 9; ++i) {
-        float z = -360.0f + i * 90.0f;
-        float radius = 50.0f + (i % 3) * 7.0f;
-        float height = 75.0f + (i % 4) * 14.0f;
-        setMaterial(i % 2 == 0 ? 0.24f : 0.29f,
-                    i % 2 == 0 ? 0.37f : 0.43f,
-                    i % 2 == 0 ? 0.34f : 0.37f, 8.0f, 0.05f);
+    // LỚP NÚI 1: DÃY ĐẠI NGÀN HẬU CẢNH PHÍA XA (3 ngọn núi khổng lồ mờ sương, lùi sâu về x = -520m)
+    // Đảm bảo chân núi xa nhất tại x = -520 + 195 = -325m, cách đường xá hơn 105m!
+    struct BackgroundPeak { float x, z, r, h; };
+    const BackgroundPeak bgPeaks[3] = {
+        { -520.0f, -140.0f, 180.0f, 360.0f },
+        { -535.0f,    5.0f, 195.0f, 400.0f },
+        { -520.0f,  150.0f, 180.0f, 350.0f }
+    };
+    for (int i = 0; i < 3; ++i) {
+        setMaterial(0.18f, 0.25f, 0.38f, 12.0f, 0.06f); // Lam chàm sương mờ xa xăm (Atmospheric Depth Haze)
         glPushMatrix();
-        glTranslatef(-278.0f, -0.38f, z);
-        drawCone(radius, height, 7);
-        setMaterial(0.82f, 0.87f, 0.88f, 12.0f, 0.08f);
-        glTranslatef(0.0f, height * 0.63f, 0.0f);
-        drawCone(radius * 0.39f, height * 0.40f, 7);
+        glTranslatef(bgPeaks[i].x, -0.38f, bgPeaks[i].z);
+        drawCone(bgPeaks[i].r, bgPeaks[i].h, 8);
+        // Chỏm tuyết vĩnh cửu trắng muốt trên đỉnh
+        setMaterial(0.94f, 0.96f, 0.99f, 25.0f, 0.2f);
+        glTranslatef(0.0f, bgPeaks[i].h * 0.65f, 0.0f);
+        drawCone(bgPeaks[i].r * 0.40f, bgPeaks[i].h * 0.38f, 8);
         glPopMatrix();
     }
+
+    // LỚP NÚI 2: DÃY NÚI TRUNG CẢNH HÙNG VĨ (Chỉ 4 ngọn núi biểu tượng phân bổ thoáng đãng)
+    // Đặt lùi tại x = -370m, bán kính r <= 95m => Chân núi chạm tối đa x = -275m,
+    // cách đường xá (x = -218m) hơn 55m và cách nhà (x = -192m) hơn 80m! TUYỆT ĐỐI KHÔNG LẤN ĐƯỜNG/NHÀ.
+    struct ForegroundPeak { float x, z, r, h, colorR, colorG, colorB; };
+    const ForegroundPeak fgPeaks[4] = {
+        { -375.0f, -160.0f, 95.0f, 240.0f, 0.24f, 0.38f, 0.33f },
+        { -365.0f,  -50.0f, 90.0f, 265.0f, 0.28f, 0.42f, 0.36f },
+        { -368.0f,   55.0f, 92.0f, 255.0f, 0.25f, 0.39f, 0.34f },
+        { -375.0f,  165.0f, 95.0f, 235.0f, 0.27f, 0.41f, 0.35f }
+    };
+    for (int i = 0; i < 4; ++i) {
+        setMaterial(fgPeaks[i].colorR, fgPeaks[i].colorG, fgPeaks[i].colorB, 10.0f, 0.05f);
+        glPushMatrix();
+        glTranslatef(fgPeaks[i].x, -0.38f, fgPeaks[i].z);
+        drawCone(fgPeaks[i].r, fgPeaks[i].h, 8);
+        // Đỉnh tuyết phủ sắc nét
+        setMaterial(0.92f, 0.95f, 0.98f, 20.0f, 0.15f);
+        glTranslatef(0.0f, fgPeaks[i].h * 0.62f, 0.0f);
+        drawCone(fgPeaks[i].r * 0.42f, fgPeaks[i].h * 0.40f, 8);
+        glPopMatrix();
+    }
+
+    // Các cụm tuabin gió phong điện trên sườn núi phía Tây
+    drawWindTurbines();
 }
 
 void drawBridge() {
@@ -1626,18 +3109,18 @@ void updateLightingAndSky() {
         lightAmbient = Color4(0.20f, 0.22f, 0.28f);
     } else if (timeOfDay >= 5.0f && timeOfDay < 7.5f) {
         float t = (timeOfDay - 5.0f) / 2.5f;
-        skyHorizon = Color4::lerp(Color4(0.95f, 0.60f, 0.35f), Color4(0.99f, 0.99f, 0.98f), t);
-        lightDiffuse = Color4::lerp(Color4(1.0f, 0.70f, 0.40f), Color4(1.0f, 0.98f, 0.92f), t);
-        lightAmbient = Color4::lerp(Color4(0.30f, 0.28f, 0.32f), Color4(0.48f, 0.52f, 0.58f), t);
+        skyHorizon = Color4::lerp(Color4(0.95f, 0.55f, 0.35f), Color4(0.65f, 0.82f, 0.95f), t);
+        lightDiffuse = Color4::lerp(Color4(1.0f, 0.65f, 0.35f), Color4(1.0f, 0.98f, 0.92f), t);
+        lightAmbient = Color4::lerp(Color4(0.24f, 0.22f, 0.28f), Color4(0.38f, 0.44f, 0.52f), t);
     } else if (timeOfDay >= 7.5f && timeOfDay < 16.5f) {
-        // Nắng trắng dịu và chân trời xanh ngọc theo phong cách minh họa mẫu.
-        skyHorizon = Color4(0.99f, 0.99f, 0.98f);
-        lightDiffuse = Color4(0.92f, 0.94f, 0.96f);
-        lightAmbient = Color4(0.24f, 0.26f, 0.30f);
+        // Nắng vàng rực rỡ và chân trời xanh ngọc dịu mát
+        skyHorizon = Color4(0.65f, 0.82f, 0.95f);
+        lightDiffuse = Color4(1.0f, 0.98f, 0.92f);
+        lightAmbient = Color4(0.38f, 0.44f, 0.52f);
     } else if (timeOfDay >= 16.5f && timeOfDay < 19.5f) {
         float t = (timeOfDay - 16.5f) / 3.0f;
-        skyHorizon = Color4::lerp(Color4(0.99f, 0.99f, 0.98f), Color4(0.08f, 0.12f, 0.22f), t);
-        lightDiffuse = Color4::lerp(Color4(1.0f, 0.65f, 0.30f), Color4(0.35f, 0.42f, 0.60f), t);
+        skyHorizon = Color4::lerp(Color4(0.65f, 0.82f, 0.95f), Color4(0.08f, 0.12f, 0.22f), t);
+        lightDiffuse = Color4::lerp(Color4(1.0f, 0.60f, 0.28f), Color4(0.35f, 0.42f, 0.60f), t);
         lightAmbient = Color4::lerp(Color4(0.38f, 0.30f, 0.32f), Color4(0.20f, 0.22f, 0.28f), t);
     } else {
         skyHorizon = Color4(0.08f, 0.12f, 0.22f);
@@ -1678,7 +3161,7 @@ void updateLightingAndSky() {
 }
 
 /**
- * Vẽ nền trắng ngà kiểu sa bàn; ban đêm chuyển sang nền tối.
+ * Vẽ bầu trời gradient đa tầng sống động: xanh ngọc ban ngày, hoàng hôn tím cam, đêm trăng sao.
  */
 void drawSkyGradient() {
     glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT | GL_DEPTH_BUFFER_BIT | GL_TRANSFORM_BIT);
@@ -1691,26 +3174,26 @@ void drawSkyGradient() {
     glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(0, 1, 0, 1, -1, 1);
     glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity();
 
-    // Ban ngày dùng một màu trắng ngà đồng nhất như ảnh tham khảo.
-    Color4 cZenith(0.99f, 0.99f, 0.98f);
-    Color4 cMid(0.99f, 0.99f, 0.98f);
-    Color4 cHorizon(0.99f, 0.99f, 0.98f);
+    // Bầu trời ban ngày phong cách Stylized Cyan / Azure Blue
+    Color4 cZenith(0.18f, 0.48f, 0.82f);
+    Color4 cMid(0.42f, 0.72f, 0.94f);
+    Color4 cHorizon(0.68f, 0.84f, 0.96f);
 
     float tDay = timeOfDay;
     if (tDay >= 5.0f && tDay < 7.5f) {
         float f = (tDay - 5.0f) / 2.5f;
-        cZenith  = Color4::lerp(Color4(0.20f, 0.18f, 0.40f), Color4(0.99f, 0.99f, 0.98f), f);
-        cMid     = Color4::lerp(Color4(0.95f, 0.55f, 0.40f), Color4(0.99f, 0.99f, 0.98f), f);
-        cHorizon = Color4::lerp(Color4(0.98f, 0.75f, 0.45f), Color4(0.99f, 0.99f, 0.98f), f);
+        cZenith  = Color4::lerp(Color4(0.15f, 0.12f, 0.35f), Color4(0.18f, 0.48f, 0.82f), f);
+        cMid     = Color4::lerp(Color4(0.95f, 0.48f, 0.35f), Color4(0.42f, 0.72f, 0.94f), f);
+        cHorizon = Color4::lerp(Color4(0.98f, 0.75f, 0.45f), Color4(0.68f, 0.84f, 0.96f), f);
     } else if (tDay >= 16.5f && tDay < 19.5f) {
         float f = (tDay - 16.5f) / 3.0f;
-        cZenith  = Color4::lerp(Color4(0.99f, 0.99f, 0.98f), Color4(0.10f, 0.12f, 0.25f), f);
-        cMid     = Color4::lerp(Color4(0.99f, 0.99f, 0.98f), Color4(0.20f, 0.18f, 0.32f), f);
-        cHorizon = Color4::lerp(Color4(0.99f, 0.99f, 0.98f), Color4(0.08f, 0.12f, 0.22f), f);
+        cZenith  = Color4::lerp(Color4(0.18f, 0.48f, 0.82f), Color4(0.06f, 0.08f, 0.20f), f);
+        cMid     = Color4::lerp(Color4(0.95f, 0.45f, 0.28f), Color4(0.16f, 0.14f, 0.28f), f);
+        cHorizon = Color4::lerp(Color4(0.98f, 0.68f, 0.36f), Color4(0.08f, 0.12f, 0.22f), f);
     } else if (tDay >= 19.5f || tDay < 5.0f) {
-        cZenith  = Color4(0.05f, 0.08f, 0.18f);
-        cMid     = Color4(0.10f, 0.14f, 0.26f);
-        cHorizon = Color4(0.08f, 0.12f, 0.22f);
+        cZenith  = Color4(0.04f, 0.06f, 0.15f);
+        cMid     = Color4(0.08f, 0.12f, 0.24f);
+        cHorizon = Color4(0.06f, 0.10f, 0.20f);
     }
 
     glBegin(GL_QUADS);
@@ -1741,6 +3224,37 @@ void drawSkyGradient() {
     glPopAttrib();
 }
 
+void drawFluffyCloud(float x, float y, float z, float scale) {
+    glPushMatrix();
+    glTranslatef(x, y, z);
+    glScalef(scale, scale * 0.52f, scale);
+
+    setMaterial(0.96f, 0.98f, 1.0f, 25.0f, 0.3f);
+    glPushMatrix();
+    glScalef(5.8f, 2.6f, 4.0f);
+    glutSolidSphere(1.0, 12, 10);
+    glPopMatrix();
+
+    glPushMatrix(); glTranslatef(3.2f, 0.4f, 0.8f); glScalef(3.8f, 2.4f, 3.2f); glutSolidSphere(1.0, 10, 8); glPopMatrix();
+    glPushMatrix(); glTranslatef(-3.2f, 0.3f, -0.6f); glScalef(3.6f, 2.2f, 3.0f); glutSolidSphere(1.0, 10, 8); glPopMatrix();
+    glPushMatrix(); glTranslatef(1.0f, 1.1f, -1.0f); glScalef(3.4f, 2.2f, 2.8f); glutSolidSphere(1.0, 10, 8); glPopMatrix();
+    glPushMatrix(); glTranslatef(-1.2f, 0.7f, 1.2f); glScalef(3.0f, 2.0f, 2.6f); glutSolidSphere(1.0, 10, 8); glPopMatrix();
+
+    glPopMatrix();
+}
+
+void drawClouds(const Vec3& center) {
+    if (nightFactor > 0.85f) return;
+    float cloudWind = animTime * 1.8f;
+    for (int i = 0; i < 14; ++i) {
+        float cx = -260.0f + std::fmod((i * 75.0f + cloudWind), 850.0f) - 150.0f;
+        float cz = -260.0f + (float)((i * 68) % 520);
+        float cy = 88.0f + (i % 3) * 18.0f;
+        float sc = 2.2f + (i % 4) * 0.65f;
+        drawFluffyCloud(cx, cy, cz, sc);
+    }
+}
+
 void drawSunAndMoon(const Vec3& center) {
     glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
     glDisable(GL_LIGHTING);
@@ -1753,22 +3267,30 @@ void drawSunAndMoon(const Vec3& center) {
     float lz = -110.0f;
 
     if (ly > -10.0f) {
-        // Mặt trời vàng rực ban ngày
-        glColor3f(1.0f, 0.94f, 0.60f);
+        // Mặt trời vàng rực ban ngày + quầng hào quang
         glPushMatrix();
         glTranslatef(center.x + lx, center.y + ly, center.z + lz);
-        glutSolidSphere(12.0, 24, 18);
-        glColor4f(1.0f, 0.85f, 0.35f, 0.25f);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glColor4f(1.0f, 0.92f, 0.50f, 0.25f);
+        glutSolidSphere(26.0, 18, 14);
+        glColor4f(1.0f, 0.85f, 0.40f, 0.45f);
         glutSolidSphere(18.0, 18, 14);
+        glColor3f(1.0f, 0.98f, 0.75f);
+        glutSolidSphere(12.0, 24, 18);
         glPopMatrix();
-    } else {
-        // Mặt trăng bạc ban đêm
-        glColor3f(0.95f, 0.96f, 1.0f);
+    }
+    
+    if (ly < 25.0f) {
+        // Mặt trăng bạc ban đêm + ánh sáng trăng
         glPushMatrix();
         glTranslatef(center.x - lx, center.y - ly, center.z - lz);
-        glutSolidSphere(9.0, 24, 18);
-        glColor4f(0.5f, 0.7f, 1.0f, 0.25f);
-        glutSolidSphere(14.0, 18, 14);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glColor4f(0.6f, 0.75f, 1.0f, 0.25f);
+        glutSolidSphere(18.0, 18, 14);
+        glColor3f(0.94f, 0.96f, 1.0f);
+        glutSolidSphere(10.0, 24, 18);
         glPopMatrix();
     }
 
@@ -1779,8 +3301,17 @@ void drawSunAndMoon(const Vec3& center) {
 // 10. MA TRẬN QUAN SÁT & GIAO DIỆN RADAR HUD SÁNG ĐẸP
 // =========================================================================================
 void setCamera() {
-    Vec3 target = drone + Vec3(0.0f, 0.12f, 0.0f);
+    float hoverBob = (1.0f - std::min(1.0f, length(droneVelocity) * 0.12f)) * std::sin(animTime * 3.2f) * 0.05f;
+    Vec3 target = drone + Vec3(0.0f, 0.12f + hoverBob, 0.0f);
     Vec3 forward = lookDirection();
+
+    // Rung lắc Camera khi va chạm (Camera Shake)
+    Vec3 shake(0.0f, 0.0f, 0.0f);
+    if (cameraShakeTimer > 0.0f) {
+        float amp = cameraShakeTimer * 0.55f;
+        shake = Vec3(std::sin(animTime * 52.0f) * amp, std::cos(animTime * 45.0f) * amp, std::sin(animTime * 36.0f) * amp * 0.5f);
+    }
+
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
@@ -1790,16 +3321,30 @@ void setCamera() {
         else if (parallelPlane == 1) gluLookAt(target.x + dist, target.y, target.z, target.x, target.y, target.z, 0, 1, 0);
         else                         gluLookAt(target.x, target.y + dist, target.z, target.x, target.y, target.z, 0, 0, -1);
     } else if (cameraMode == 0) {
-        // FPV - Góc nhìn từ buồng lái Drone
-        Vec3 eye = drone + Vec3(0.0f, 0.15f, 0.0f);
+        // FPV - Góc nhìn từ cụm Gimbal Camera của Drone
+        Vec3 eye = drone + Vec3(0.0f, -0.05f + hoverBob, -0.32f) + shake;
         Vec3 look = eye + forward * 38.0f;
         gluLookAt(eye.x, eye.y, eye.z, look.x, look.y, look.z, 0, 1, 0);
     } else if (cameraMode == 1) {
-        // Camera thứ ba bám theo sau lưng Drone
+        // Camera thứ ba bám theo sau lưng Drone với Smooth Damp & Spring Arm
         float r = cameraR * zoomD;
-        // Lùi camera và chúc xuống nhẹ để thấy drone cùng mặt đường phía trước.
-        Vec3 eye = drone - forward * r + Vec3(0.0f, r * 0.65f, 0.0f);
-        Vec3 look = drone + forward * 8.0f + Vec3(0.0f, -9.0f, 0.0f);
+        float speedFactor = std::min(1.0f, length(droneVelocity) / forwardSpeed);
+        float dynamicR = r * (1.0f + speedFactor * 0.16f); // Giãn nhẹ camera khi bay tốc độ cao
+
+        Vec3 desiredEye = drone - forward * dynamicR + Vec3(0.0f, dynamicR * 0.54f + hoverBob, 0.0f);
+        Vec3 desiredLook = drone + forward * 6.0f + Vec3(0.0f, -4.0f + hoverBob, 0.0f);
+
+        if (!smoothCamInitialized) {
+            smoothCameraEye = desiredEye;
+            smoothCameraLook = desiredLook;
+            smoothCamInitialized = true;
+        } else {
+            smoothCameraEye = smoothCameraEye + (desiredEye - smoothCameraEye) * 0.16f;
+            smoothCameraLook = smoothCameraLook + (desiredLook - smoothCameraLook) * 0.22f;
+        }
+
+        Vec3 eye = smoothCameraEye + shake;
+        Vec3 look = smoothCameraLook + shake;
         gluLookAt(eye.x, eye.y, eye.z, look.x, look.y, look.z, 0, 1, 0);
     } else {
         // Quỹ đạo tự do quanh Drone
@@ -1807,6 +3352,7 @@ void setCamera() {
         Vec3 eye(target.x + r * std::cos(phi) * std::sin(theta),
                  target.y + r * std::sin(phi),
                  target.z + r * std::cos(phi) * std::cos(theta));
+        eye = eye + shake;
         gluLookAt(eye.x, eye.y, eye.z, target.x, target.y, target.z, 0, 1, 0);
     }
 }
@@ -1998,6 +3544,102 @@ void drawHud() {
         drawText(windowWidth * 0.46f, windowHeight * 0.52f, "PAUSED");
     }
 
+    // THÔNG BÁO HẠ CÁNH THÀNH CÔNG (LANDED BADGE)
+    if (isDroneLanded) {
+        float pulse = 0.85f + 0.15f * std::sin(animTime * 6.0f);
+        glColor4f(0.06f, 0.42f * pulse, 0.28f * pulse, 0.92f);
+        glBegin(GL_QUADS);
+            glVertex2f(windowWidth * 0.5f - 230, windowHeight * 0.5f + 40);
+            glVertex2f(windowWidth * 0.5f + 230, windowHeight * 0.5f + 40);
+            glVertex2f(windowWidth * 0.5f + 230, windowHeight * 0.5f + 110);
+            glVertex2f(windowWidth * 0.5f - 230, windowHeight * 0.5f + 110);
+        glEnd();
+
+        glColor3f(1.0f, 0.88f, 0.25f);
+        glLineWidth(2.0f);
+        glBegin(GL_LINE_LOOP);
+            glVertex2f(windowWidth * 0.5f - 230, windowHeight * 0.5f + 40);
+            glVertex2f(windowWidth * 0.5f + 230, windowHeight * 0.5f + 40);
+            glVertex2f(windowWidth * 0.5f + 230, windowHeight * 0.5f + 110);
+            glVertex2f(windowWidth * 0.5f - 230, windowHeight * 0.5f + 110);
+        glEnd();
+        glLineWidth(1.0f);
+
+        glColor3f(1.0f, 1.0f, 1.0f);
+        drawText(windowWidth * 0.5f - 188, windowHeight * 0.5f + 85,
+                 "★ DA HA CANH AN TOAN TAI HELIPAD CAO OC ★", GLUT_BITMAP_HELVETICA_12);
+
+        glColor3f(1.0f, 0.95f, 0.35f);
+        drawText(windowWidth * 0.5f - 165, windowHeight * 0.5f + 56,
+                 "[CAT CANH]: BAM T HOAC SPACE DE BAY TIEP", GLUT_BITMAP_HELVETICA_12);
+    }
+
+    // 4. CẢNH BÁO KHOẢNG CÁCH VẬT CẢN (PROXIMITY WARNING)
+    if (proximityDist < 6.5f) {
+        float alertPulse = 0.55f + 0.45f * std::sin(animTime * 12.0f);
+        glColor4f(0.88f * alertPulse + 0.1f, 0.12f, 0.12f, 0.88f);
+        glBegin(GL_QUADS);
+            glVertex2f(windowWidth * 0.5f - 145, windowHeight - 58);
+            glVertex2f(windowWidth * 0.5f + 145, windowHeight - 58);
+            glVertex2f(windowWidth * 0.5f + 145, windowHeight - 20);
+            glVertex2f(windowWidth * 0.5f - 145, windowHeight - 20);
+        glEnd();
+        glColor3f(1.0f, 0.95f, 0.30f);
+        std::ostringstream alertStr;
+        alertStr << "!! CANH BAO: VAT CAN GAN (" << std::fixed << std::setprecision(1) << proximityDist << "m) !!";
+        drawText(windowWidth * 0.5f - 126, windowHeight - 44, alertStr.str(), GLUT_BITMAP_HELVETICA_12);
+    }
+
+    // 5. TÂM NGẮM & ĐƯỜNG CHÂN TRỜI OSD BUỒNG LÁI FPV
+    if (cameraMode == 0 && !parallelProjection) {
+        float cx = windowWidth * 0.5f, cy = windowHeight * 0.5f;
+        glPushMatrix();
+        glTranslatef(cx, cy, 0.0f);
+        glRotatef(droneRoll, 0.0f, 0.0f, 1.0f);
+
+        // Đường chân trời FPV (Artificial Horizon)
+        glColor4f(0.2f, 0.88f, 0.95f, 0.70f);
+        glLineWidth(2.0f);
+        glBegin(GL_LINES);
+            glVertex2f(-75.0f, -dronePitch * 1.6f);
+            glVertex2f(-22.0f, -dronePitch * 1.6f);
+            glVertex2f( 22.0f, -dronePitch * 1.6f);
+            glVertex2f( 75.0f, -dronePitch * 1.6f);
+        glEnd();
+
+        // Thang góc nghiêng pitch ladder
+        glLineWidth(1.2f);
+        glBegin(GL_LINES);
+            glVertex2f(-32.0f, -dronePitch * 1.6f + 25.0f); glVertex2f(-12.0f, -dronePitch * 1.6f + 25.0f);
+            glVertex2f( 12.0f, -dronePitch * 1.6f + 25.0f); glVertex2f( 32.0f, -dronePitch * 1.6f + 25.0f);
+            glVertex2f(-32.0f, -dronePitch * 1.6f - 25.0f); glVertex2f(-12.0f, -dronePitch * 1.6f - 25.0f);
+            glVertex2f( 12.0f, -dronePitch * 1.6f - 25.0f); glVertex2f( 32.0f, -dronePitch * 1.6f - 25.0f);
+        glEnd();
+
+        // Tâm ngắm FPV Reticle
+        glLineWidth(1.6f);
+        glBegin(GL_LINES);
+            glVertex2f(0.0f, -10.0f); glVertex2f(0.0f, 10.0f);
+            glVertex2f(-10.0f, 0.0f); glVertex2f(10.0f, 0.0f);
+        glEnd();
+        glLineWidth(1.0f);
+        glPopMatrix();
+    }
+
+    // 6. VIỀN ĐỎ NHẤP NHÁY KHI VA CHẠM (COLLISION VIGNETTE)
+    if (collisionFlashTimer > 0.0f) {
+        float alpha = clampf(collisionFlashTimer * 0.85f, 0.0f, 0.65f);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glColor4f(0.95f, 0.10f, 0.10f, alpha);
+        glLineWidth(10.0f);
+        glBegin(GL_LINE_LOOP);
+            glVertex2f(5, 5); glVertex2f(windowWidth - 5, 5);
+            glVertex2f(windowWidth - 5, windowHeight - 5); glVertex2f(5, windowHeight - 5);
+        glEnd();
+        glLineWidth(1.0f);
+    }
+
     glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
     glPopAttrib();
 }
@@ -2027,8 +3669,12 @@ void display() {
 
     glPolygonMode(GL_FRONT_AND_BACK, wireframeMode ? GL_LINE : GL_FILL);
 
-    if (nightFactor > 0.5f) drawSunAndMoon(drone);
+    drawSunAndMoon(drone);
+    drawClouds(drone);
+    drawHotAirBalloon();
     drawCity(drone);
+    drawDroneShadow();
+    drawDroneDownwash();
     drawDrone();
 
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
@@ -2042,12 +3688,17 @@ void display() {
 // =========================================================================================
 // 12. LOGIC VẬT LÝ DRONE & VÒNG LẶP ĐIỀU KHIỂN
 // =========================================================================================
-void playerHit() {
+void onDroneCollision(const Vec3& hitNormal) {
     if (invulnerableTimer > 0.0f) return;
-    float avenue = CITY_GRID_SPACING * 6.0f;
-    drone = Vec3(std::round(drone.x / avenue) * avenue, clampf(drone.y, 14.0f, 75.0f), std::round(drone.z / avenue) * avenue);
-    droneVelocity = Vec3();
-    invulnerableTimer = 1.0f;
+    float curSpeed = length(droneVelocity);
+    droneVelocity = hitNormal * std::max(7.5f, curSpeed * 0.75f) + Vec3(0.0f, 1.8f, 0.0f);
+    cameraShakeTimer = 0.40f;
+    collisionFlashTimer = 0.55f;
+    invulnerableTimer = 0.45f;
+}
+
+void playerHit() {
+    onDroneCollision(Vec3(0.0f, 1.0f, 0.0f));
 }
 
 void updateGame(float dt) {
@@ -2066,16 +3717,60 @@ void updateGame(float dt) {
     Vec3 targetVelocity = wish * forwardSpeed + Vec3(0.0f, lift * 7.5f, 0.0f);
     if (length(targetVelocity) > forwardSpeed) targetVelocity = normalized(targetVelocity) * forwardSpeed;
 
-    float blend = 1.0f - std::exp(-5.5f * dt);
+    // Quán tính trôi êm ái khi nhả phím
+    float blend = 1.0f - std::exp(-4.8f * dt);
     droneVelocity = droneVelocity + (targetVelocity - droneVelocity) * blend;
     drone = drone + droneVelocity * dt;
-    // Biên cứng của khu demo: drone không thể mở rộng bản đồ hoặc bay ra khỏi đảo.
-    drone.x = clampf(drone.x, DRONE_MIN_X, DRONE_MAX_X);
-    drone.z = clampf(drone.z, -DRONE_LIMIT_Z, DRONE_LIMIT_Z);
-    if ((drone.x <= DRONE_MIN_X && droneVelocity.x < 0.0f) ||
-        (drone.x >= DRONE_MAX_X && droneVelocity.x > 0.0f)) droneVelocity.x = 0.0f;
-    if ((drone.z <= -DRONE_LIMIT_Z && droneVelocity.z < 0.0f) ||
-        (drone.z >=  DRONE_LIMIT_Z && droneVelocity.z > 0.0f)) droneVelocity.z = 0.0f;
+
+    float radius = 0.95f; // Sải cánh gọn gàng, tỉ lệ chuẩn
+
+    // Biên bản đồ đô thị và đảo (bật nảy khi chạm biên)
+    if (drone.x <= DRONE_MIN_X + radius) {
+        drone.x = DRONE_MIN_X + radius + 0.1f;
+        onDroneCollision(Vec3(1.0f, 0.0f, 0.0f));
+    } else if (drone.x >= DRONE_MAX_X - radius) {
+        drone.x = DRONE_MAX_X - radius - 0.1f;
+        onDroneCollision(Vec3(-1.0f, 0.0f, 0.0f));
+    }
+    if (drone.z <= -DRONE_LIMIT_Z + radius) {
+        drone.z = -DRONE_LIMIT_Z + radius + 0.1f;
+        onDroneCollision(Vec3(0.0f, 0.0f, 1.0f));
+    } else if (drone.z >= DRONE_LIMIT_Z - radius) {
+        drone.z = DRONE_LIMIT_Z - radius - 0.1f;
+        onDroneCollision(Vec3(0.0f, 0.0f, -1.0f));
+    }
+
+    if (drone.y < 1.2f) {
+        drone.y = 1.2f;
+        onDroneCollision(Vec3(0.0f, 1.0f, 0.0f));
+    } else if (drone.y > 140.0f) {
+        drone.y = 140.0f;
+        onDroneCollision(Vec3(0.0f, -1.0f, 0.0f));
+    }
+
+    // KIỂM TRA HẠ CÁNH AN TOÀN TRÊN 2 BÃI ĐÁP TRỰC THĂNG (HELIPAD LANDING DETECTION)
+    float dPad1 = std::hypot(drone.x - HELIPAD_1_X, drone.z - HELIPAD_1_Z);
+    float dPad2 = std::hypot(drone.x - HELIPAD_2_X, drone.z - HELIPAD_2_Z);
+
+    if (dPad1 < 4.8f && std::abs(drone.y - HELIPAD_1_Y) < 1.15f && length(droneVelocity) < 4.5f) {
+        drone.y = HELIPAD_1_Y;
+        isDroneLanded = true;
+    } else if (dPad2 < 4.8f && std::abs(drone.y - HELIPAD_2_Y) < 1.15f && length(droneVelocity) < 4.5f) {
+        drone.y = HELIPAD_2_Y;
+        isDroneLanded = true;
+    } else if (isDroneLanded) {
+        // Cất cánh khi người chơi bấm T, Space hoặc W
+        if (keys['t'] || keys['T'] || keys[' '] || keys['w'] || keys['W']) {
+            isDroneLanded = false;
+            droneVelocity.y = 5.2f;
+        }
+    }
+
+    if (isDroneLanded) {
+        droneVelocity = Vec3(0.0f, 0.0f, 0.0f);
+        droneRoll *= std::exp(-8.0f * dt);
+        dronePitch *= std::exp(-8.0f * dt);
+    }
 
     // Nghiêng thân Drone (Roll & Pitch)
     float rollTarget = clampf(-side * 24.0f + mouseRollImpulse, -38.0f, 38.0f);
@@ -2084,48 +3779,96 @@ void updateGame(float dt) {
     dronePitch += (pitchTarget - dronePitch) * (1.0f - std::exp(-6.0f * dt));
     mouseRollImpulse *= std::exp(-7.0f * dt);
 
-    rotorAngle = std::fmod(rotorAngle + 1600.0f * dt, 360.0f);
+    rotorAngle = std::fmod(rotorAngle + (isDroneLanded ? 220.0f : 1600.0f) * dt, 360.0f);
 
     if (invulnerableTimer > 0.0f) invulnerableTimer = std::max(0.0f, invulnerableTimer - dt);
 
-    float radius = 1.15f;
-    if (drone.y < 1.0f || drone.y > 90.0f) playerHit();
-
+    // Tính toán khoảng cách vật cản gần nhất và phản xạ va chạm mềm
+    proximityDist = 999.0f;
     int gx0 = (int)std::floor((drone.x - 24.0f) / CITY_GRID_SPACING) - 1;
     int gx1 = (int)std::floor((drone.x + 24.0f) / CITY_GRID_SPACING) + 1;
     int gz0 = (int)std::floor((drone.z - 24.0f) / CITY_GRID_SPACING) - 1;
     int gz1 = (int)std::floor((drone.z + 24.0f) / CITY_GRID_SPACING) + 1;
 
     bool buildingHit = false;
+    Vec3 hitNormal(0.0f, 1.0f, 0.0f);
+
     for (int gx = gx0; gx <= gx1 && !buildingHit; gx++) {
         for (int gz = gz0; gz <= gz1 && !buildingHit; gz++) {
             if (hasBuildingAt(gx, gz)) {
-                buildingHit = sphereAabbHit(drone, radius, getBuilding(gx, gz));
+                Vec3 norm;
+                float dist = 999.0f;
+                Building b = getBuilding(gx, gz);
+                if (checkBuildingHitAndResolve(drone, radius, b, norm, dist)) {
+                    buildingHit = true;
+                    hitNormal = norm;
+                    drone = drone + norm * (radius - dist + 0.15f);
+                }
+                proximityDist = std::min(proximityDist, std::max(0.0f, dist - radius));
+            }
+        }
+    }
+
+    // Va chạm với khối đế thương mại tại các quận đô thị (AMENITY_CITY)
+    int districtX = (int)std::floor(drone.x / (CITY_GRID_SPACING * 6.0f));
+    int districtZ = (int)std::floor(drone.z / (CITY_GRID_SPACING * 6.0f));
+    for (int dx = districtX - 1; dx <= districtX + 1 && !buildingHit; ++dx) {
+        for (int dz = districtZ - 1; dz <= districtZ + 1 && !buildingHit; ++dz) {
+            if (districtAmenity(dx, dz) == AMENITY_CITY) {
+                float px = dx * (CITY_GRID_SPACING * 6.0f) + 68.0f;
+                float pz = dz * (CITY_GRID_SPACING * 6.0f) + 58.0f;
+                Building podiumBox = { px, pz, 48.0f, 42.0f, 7.2f, 0 };
+                Vec3 norm;
+                float dist = 999.0f;
+                if (checkBuildingHitAndResolve(drone, radius, podiumBox, norm, dist)) {
+                    buildingHit = true;
+                    hitNormal = norm;
+                    drone = drone + norm * (radius - dist + 0.15f);
+                }
+                proximityDist = std::min(proximityDist, std::max(0.0f, dist - radius));
             }
         }
     }
 
     // Va chạm với trung tâm thương mại và vành khán đài sân vận động.
-    int districtX = (int)std::floor(drone.x / (CITY_GRID_SPACING * 6.0f));
-    int districtZ = (int)std::floor(drone.z / (CITY_GRID_SPACING * 6.0f));
     for (int dx = districtX - 1; dx <= districtX + 1 && !buildingHit; ++dx) {
         for (int dz = districtZ - 1; dz <= districtZ + 1 && !buildingHit; ++dz) {
             int kind = districtAmenity(dx, dz);
-            if (kind == AMENITY_MALL || kind == AMENITY_SCHOOL || kind == AMENITY_HOSPITAL)
-                buildingHit = sphereAabbHit(drone, radius, amenityCollider(dx, dz, kind));
-            else if (kind == AMENITY_STADIUM) buildingHit = sphereStadiumRingHit(drone, radius, amenityCollider(dx, dz, kind));
+            if (kind == AMENITY_MALL || kind == AMENITY_SCHOOL || kind == AMENITY_HOSPITAL) {
+                Vec3 norm;
+                float dist = 999.0f;
+                Building b = amenityCollider(dx, dz, kind);
+                if (checkBuildingHitAndResolve(drone, radius, b, norm, dist)) {
+                    buildingHit = true;
+                    hitNormal = norm;
+                    drone = drone + norm * (radius - dist + 0.15f);
+                }
+                proximityDist = std::min(proximityDist, std::max(0.0f, dist - radius));
+            } else if (kind == AMENITY_STADIUM) {
+                if (sphereStadiumRingHit(drone, radius, amenityCollider(dx, dz, kind))) {
+                    buildingHit = true;
+                    hitNormal = normalized(Vec3(drone.x - dx * 105.0f, 0.5f, drone.z - dz * 105.0f));
+                }
+            }
         }
     }
-    if (buildingHit) playerHit();
+    if (buildingHit) onDroneCollision(hitNormal);
+
+    if (cameraShakeTimer > 0.0f) cameraShakeTimer = std::max(0.0f, cameraShakeTimer - dt);
+    if (collisionFlashTimer > 0.0f) collisionFlashTimer = std::max(0.0f, collisionFlashTimer - dt);
 
     updateCityCars(dt);
 }
 
 void resetGame() {
+    isDroneLanded = false;
     drone = Vec3(0.0f, 18.0f, 0.0f);
     droneVelocity = Vec3();
     droneRoll = dronePitch = rotorAngle = mouseRollImpulse = 0.0f;
     invulnerableTimer = 0.0f;
+    cameraShakeTimer = collisionFlashTimer = 0.0f;
+    proximityDist = 999.0f;
+    smoothCamInitialized = false;
     paused = wireframeMode = false;
     cameraMode = 1;
     parallelProjection = false;
@@ -2158,6 +3901,7 @@ void keyboardDown(unsigned char key, int, int) {
     keys[key] = true;
     if (key == 27) std::exit(0);
     if (key == 'r' || key == 'R') resetGame();
+
 
     if (key == 'c' || key == 'C') {
         cameraMode = (cameraMode + 1) % 3;
